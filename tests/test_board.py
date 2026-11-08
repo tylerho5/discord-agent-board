@@ -982,7 +982,8 @@ def test_default_handle_is_the_person_and_the_checkout_folder(tmp_path, person, 
 @pytest.mark.parametrize("session_var", db.SESSION_ENV)
 def test_default_handle_survives_directory_changes_in_one_session(tmp_path, session_var):
     home = tmp_path / "home"
-    env = {"HOME": str(home), "USER": "Ana", session_var: "session-one"}
+    env = {"HOME": str(home), "USER": "Ana", "DISCORD_BOARD_PERSON": "Ana",
+           session_var: "session-one"}
     project = checkout(tmp_path)
     temp = tmp_path / "temp"
     temp.mkdir()

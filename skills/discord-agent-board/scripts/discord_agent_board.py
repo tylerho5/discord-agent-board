@@ -90,6 +90,7 @@ class BoardConfig:
     bot_token: Optional[str] = field(default=None, repr=False)
     webhook_url: Optional[str] = field(default=None, repr=False)
     state_dir: Optional[Path] = None
+    profile: Optional[str] = None
 
 
 def _read_json(path):
@@ -185,21 +186,59 @@ def derive_handle(person, env, cwd):
     return handle if handle and HANDLE_RE.fullmatch(handle) else None
 
 
-def session_handle(person, env, cwd, state_dir):
+def session_handle_path(env, state_dir):
     session = next((f"{name}:{env[name].strip()}" for name in SESSION_ENV
                     if (env.get(name) or "").strip()), None)
     if not session:
-        return derive_handle(person, env, cwd)
-    path = state_dir / "handles" / (hashlib.sha256(session.encode()).hexdigest() + ".json")
-    saved = _read_json(path).get("agent")
-    if saved:
-        return validate_handle(saved)
-    agent = derive_handle(person, env, cwd)
-    if agent:
+        return None
+    return Path(state_dir) / "handles" / (hashlib.sha256(session.encode()).hexdigest() + ".json")
+
+
+def session_workdir(env, cwd):
+    candidates = []
+    if env.get("PI_SESSION_FILE"):
         try:
-            _write_json(path, {"agent": agent})
-        except OSError as err:
-            raise BoardError(f"cannot save the session's board handle: {err.strerror}") from None
+            with Path(env["PI_SESSION_FILE"]).open(encoding="utf-8-sig") as stream:
+                header = json.loads(stream.readline())
+            if isinstance(header, dict) and header.get("type") == "session":
+                candidates.append(header.get("cwd"))
+        except (OSError, ValueError):
+            pass
+    candidates.append(env.get("CLAUDE_PROJECT_DIR"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            path = Path(candidate).expanduser()
+            if path.is_absolute() and path.is_dir():
+                return path
+    return Path(cwd)
+
+
+def save_session_handle(env, state_dir, agent):
+    path = session_handle_path(env, state_dir)
+    if path is None:
+        raise BoardError("no agent session ID found; set DISCORD_BOARD_SESSION to use identity --set/--reset")
+    try:
+        if agent is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_json(path, {"agent": validate_handle(agent)})
+    except OSError as err:
+        raise BoardError(f"cannot save the session's board handle: {err.strerror}") from None
+
+
+def saved_session_handle(env, state_dir):
+    path = session_handle_path(env, state_dir)
+    saved = _read_json(path).get("agent") if path is not None else None
+    return validate_handle(saved) if saved else None
+
+
+def session_handle(person, env, cwd, state_dir, *, persist=True):
+    saved = saved_session_handle(env, state_dir)
+    if saved:
+        return saved
+    agent = derive_handle(person, env, session_workdir(env, cwd))
+    if agent and session_handle_path(env, state_dir) is not None and persist:
+        save_session_handle(env, state_dir, agent)
     return agent
 
 
@@ -208,7 +247,7 @@ def settings_path_for(env, config_path=None):
     return Path(config_path or home / ".config" / "discord-agent-board" / "config.json")
 
 
-def load_config(overrides, *, env, config_path=None, cwd=None):
+def load_config(overrides, *, env, config_path=None, cwd=None, persist_handle=True):
     """Merge CLI overrides, then DISCORD_BOARD_* environment, then local files.
 
     Nonsecret settings live in ~/.config/discord-agent-board/config.json and
@@ -222,6 +261,19 @@ def load_config(overrides, *, env, config_path=None, cwd=None):
     config_path = Path(config_path)
     settings = _read_json(config_path)
     creds = _read_json(config_path.parent / "credentials.json")
+    profile = overrides.get("profile") or env.get("DISCORD_BOARD_PROFILE") or None
+    if profile:
+        profile = str(profile)
+        settings_profiles, creds_profiles = settings.get("profiles", {}), creds.get("profiles", {})
+        if not isinstance(settings_profiles, dict) or not isinstance(creds_profiles, dict):
+            raise BoardError("profiles must hold JSON objects in config.json and credentials.json")
+        if profile not in settings_profiles and profile not in creds_profiles:
+            raise BoardError(f"unknown board profile {profile!r}; add it to config.json or credentials.json")
+        for base, profiles in ((settings, settings_profiles), (creds, creds_profiles)):
+            overlay = profiles.get(profile, {})
+            if not isinstance(overlay, dict):
+                raise BoardError(f"board profile {profile!r} must hold a JSON object")
+            base.update(overlay)
 
     def pick(key, env_name):
         for source in (overrides.get(key), env.get(env_name), settings.get(key)):
@@ -229,22 +281,32 @@ def load_config(overrides, *, env, config_path=None, cwd=None):
                 return str(source)
         return None
 
-    bot_token = (env.get("DISCORD_BOARD_BOT_TOKEN") or creds.get("bot_token")
+    bot_token = (overrides.get("bot_token") or env.get("DISCORD_BOARD_BOT_TOKEN") or creds.get("bot_token")
                  or env.get("DISCORD_BOT_TOKEN"))
     if not bot_token:
         bot_token = _read_json(home / ".config" / "mcp-discord" / "config.json").get("botToken")
     state_dir = pick("state_dir", "DISCORD_BOARD_STATE_DIR")
     state_dir = (Path(state_dir).expanduser() if state_dir
                  else home / ".local" / "state" / "discord-agent-board")
-    agent = pick("agent", "DISCORD_BOARD_AGENT") or session_handle(
-        settings.get("person"), env, cwd or Path.cwd(), state_dir)
+    guild_id = pick("guild_id", "DISCORD_BOARD_GUILD_ID")
+    channel_id = pick("channel_id", "DISCORD_BOARD_CHANNEL_ID")
+    person = pick("person", "DISCORD_BOARD_PERSON")
+    explicit_agent = overrides.get("agent") or env.get("DISCORD_BOARD_AGENT")
+    configured_board = bool(guild_id and channel_id and bot_token)
+    agent = (str(explicit_agent) if explicit_agent
+             else saved_session_handle(env, state_dir)
+             or pick("agent", "DISCORD_BOARD_AGENT")
+             or session_handle(person, env, cwd or Path.cwd(), state_dir,
+                               persist=persist_handle and bool(_slug(person) or configured_board)))
     return BoardConfig(
-        guild_id=pick("guild_id", "DISCORD_BOARD_GUILD_ID"),
-        channel_id=pick("channel_id", "DISCORD_BOARD_CHANNEL_ID"),
+        guild_id=guild_id,
+        channel_id=channel_id,
         agent=agent,
         bot_token=bot_token or None,
-        webhook_url=env.get("DISCORD_BOARD_WEBHOOK_URL") or creds.get("webhook_url") or None,
+        webhook_url=(overrides.get("webhook_url") or env.get("DISCORD_BOARD_WEBHOOK_URL")
+                     or creds.get("webhook_url") or None),
         state_dir=state_dir,
+        profile=profile,
     )
 
 
@@ -375,8 +437,10 @@ def learn_guild(config, *, env, config_path=None, opener=None):
     path = settings_path_for(env, config_path)
     try:
         settings = _read_json(path)
-        if settings.get("channel_id") == config.channel_id:
-            settings["guild_id"] = guild_id
+        destination = (settings.get("profiles", {}).get(config.profile, {})
+                       if config.profile else settings)
+        if destination.get("channel_id") == config.channel_id:
+            destination["guild_id"] = guild_id
             _write_json(path, settings)
     except (BoardError, OSError):
         pass
@@ -716,6 +780,13 @@ class Board:
             "id": str(msg["id"]),
             "channel_id": channel_id,
             "author": author.get("global_name") or author.get("username") or "unknown",
+            "author_id": author.get("id"),
+            "username": author.get("username"),
+            "display_name": author.get("global_name") or author.get("username"),
+            "mentioned_users": [
+                {"id": user.get("id"), "username": user.get("username"),
+                 "display_name": user.get("global_name") or user.get("username")}
+                for user in msg.get("mentions") or []],
             "content": content,
             "timestamp": msg.get("timestamp"),
             "url": f"https://discord.com/channels/{self.config.guild_id}/{channel_id}/{msg['id']}",
@@ -771,6 +842,42 @@ class Board:
         _write_json(path, {"threads": threads})
         self._own.pop(agent, None)
 
+    def follow(self, target, *, agent):
+        """Subscribe locally to future messages in an existing public board thread."""
+        validate_handle(agent)
+        location = self._subscription_target(target)
+        thread_id = str(location["id"])
+        since = self._own_threads(agent).get(thread_id)
+        if since is None:
+            latest = self.client.get_messages(thread_id, limit=1)
+            since = max((int(msg["id"]) for msg in latest), default=int(thread_id))
+        self._remember_thread(agent, thread_id, since)
+        return self._subscription_result(location, agent, True, str(since))
+
+    def unfollow(self, target, *, agent):
+        """Remove a local thread subscription without changing Discord."""
+        validate_handle(agent)
+        location = self._subscription_target(target)
+        path = self._state_path("threads", agent)
+        state = _read_json(path)
+        threads = dict(state.get("threads", {}))
+        if threads.pop(str(location["id"]), None) is not None:
+            _write_json(path, dict(state, threads=threads))
+        self._own.pop(agent, None)
+        return self._subscription_result(location, agent, False, None)
+
+    def _subscription_target(self, target):
+        location, message_id = self._resolve(str(target).strip(), None)
+        if message_id is not None or location.get("type") != PUBLIC_THREAD:
+            raise BoardError("follow and unfollow take an existing public board thread ID or link")
+        return location
+
+    def _subscription_result(self, location, agent, subscribed, since):
+        thread_id = str(location["id"])
+        return {"agent": agent, "thread_id": thread_id, "thread_name": location.get("name"),
+                "url": f"https://discord.com/channels/{self.config.guild_id}/{thread_id}",
+                "subscribed": subscribed, "since": since}
+
     def _addressed(self, msg, loc_id, agent, pattern=None):
         """A tag, a reply to the handle's post, or a later message in one of its threads."""
         if _own_post(msg, agent):
@@ -814,8 +921,8 @@ class Board:
 
     # -- unread views: read (new) and inbox ------------------------------------
 
-    def inbox(self, *, agent, limit=PAGE_LIMIT):
-        """Unread messages addressed to the handle, from the channel and every public thread."""
+    def inbox(self, *, agent, limit=PAGE_LIMIT, peek=False):
+        """Unread messages addressed to the handle; peek leaves reading state unchanged."""
         validate_handle(agent)
         _check_limit(limit)
         pattern = tag_pattern(agent)
@@ -834,6 +941,8 @@ class Board:
             first_note="first inbox for {agent} on this machine: scanned messages since {since}; "
                        "earlier ones were not scanned")
         page.view = "inbox"
+        if peek:
+            page.writes.clear()
         return self._annotate(page, agent)
 
     def _read_new(self, location, agent, limit):
@@ -939,9 +1048,11 @@ class Board:
 
     # -- read ----------------------------------------------------------------
 
-    def read(self, target=None, *, agent, recent=False, limit=None, before=None, thread=None):
+    def read(self, target=None, *, agent, recent=False, limit=None, before=None, thread=None,
+             peek=False):
         """The channel's top level or a thread: unread messages by default, or the newest
-        ``limit`` with ``recent``/``before``. A message link shows that message in context."""
+        ``limit`` with ``recent``/``before``. A message link shows that message in context.
+        With ``peek``, committing the returned page leaves reading state unchanged."""
         validate_handle(agent)
         if limit is not None:
             _check_limit(limit)
@@ -964,6 +1075,8 @@ class Board:
         else:
             page = self._read_new(location, agent, limit or PAGE_LIMIT)
         page.location = self._describe(location, agent)
+        if peek:
+            page.writes.clear()
         return self._annotate(page, agent)
 
     def _resolve(self, target, thread):
