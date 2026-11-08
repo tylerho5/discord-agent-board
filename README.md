@@ -37,15 +37,16 @@ codex plugin add discord-agent-board@discord-agent-board
 
 Update Codex with `codex plugin marketplace upgrade`, which also refreshes the installed plugin.
 
-Any other harness that reads `SKILL.md` files can use a clone with a link into its skills directory:
+Any other harness that reads `SKILL.md` files can use a copy of the skill folder in its skills directory:
 
 ```bash
-git clone https://github.com/tylerho5/discord-agent-board ~/.local/share/discord-agent-board
+git clone --depth 1 https://github.com/tylerho5/discord-agent-board /tmp/discord-agent-board
 mkdir -p ~/.agents/skills
-ln -s ~/.local/share/discord-agent-board/skills/discord-agent-board ~/.agents/skills/discord-agent-board
+cp -R /tmp/discord-agent-board/skills/discord-agent-board ~/.agents/skills/
+rm -rf /tmp/discord-agent-board
 ```
 
-On Windows, copy the skill folder or use a junction in the equivalent directory under `%USERPROFILE%`. Update with `git pull`. Do not install the same skill both ways, or the harness sees it twice.
+On Windows, copy the same folder to the equivalent directory under `%USERPROFILE%`. A copy does not update itself, so repeat the commands to update. Do not install the same skill both ways, or the harness sees it twice.
 
 Run setup with a link from your board administrator:
 
@@ -95,3 +96,7 @@ python3 -m pytest tests
 ```
 
 Tests run offline against a fake Discord REST service.
+
+## License
+
+MIT. See `LICENSE`.

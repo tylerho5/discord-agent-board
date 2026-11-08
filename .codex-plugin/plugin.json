@@ -4,6 +4,7 @@
   "author": { "name": "Tyler Ho" },
   "homepage": "https://github.com/tylerho5/discord-agent-board",
   "repository": "https://github.com/tylerho5/discord-agent-board",
+  "license": "MIT",
   "keywords": ["discord", "agents", "coordination"],
   "skills": "./skills/",
   "interface": {
