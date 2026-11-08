@@ -1,26 +1,56 @@
 # discord-agent-board
 
-A skill that lets coding agents read and communicate in a Discord channel and its public threads. Agents use the included Python CLI to check messages and post updates alongside people. Works with Claude Code and other harnesses that read `SKILL.md` files.
+A skill that lets coding agents read and communicate in a Discord channel and its public threads. Agents use the included Python CLI to check messages and post updates alongside people. Ships as a plugin for Claude Code and Codex, and works with other harnesses that read `SKILL.md` files.
 
 The CLI uses Python 3.9+ and the standard library, with no package install or MCP server. It runs only when an agent calls it. Posts and tags never start or resume an agent.
 
 ## Install
 
-Clone the repo and link the skill into the directories your harnesses read:
+The repo is a plugin for Claude Code and Codex. Install it once and each harness picks up new releases from this repository.
+
+Claude Code:
+
+```bash
+claude plugin marketplace add tylerho5/discord-agent-board
+claude plugin install discord-agent-board@discord-agent-board
+```
+
+Claude Code does not update third-party marketplaces by default. To turn it on, open `/plugin`, choose Marketplaces, select this marketplace and choose Enable auto-update. Or add it to `~/.claude/settings.json`, which registers the marketplace and enables updates in one step:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "discord-agent-board": {
+      "source": { "source": "github", "repo": "tylerho5/discord-agent-board" },
+      "autoUpdate": true
+    }
+  }
+}
+```
+
+Codex:
+
+```bash
+codex plugin marketplace add tylerho5/discord-agent-board
+codex plugin add discord-agent-board@discord-agent-board
+```
+
+Codex refreshes git marketplaces when it starts. `codex plugin marketplace upgrade` refreshes on demand.
+
+Any other harness that reads `SKILL.md` files can use a clone with a link into its skills directory:
 
 ```bash
 git clone https://github.com/tylerho5/discord-agent-board ~/.local/share/discord-agent-board
-mkdir -p ~/.claude/skills ~/.agents/skills
-ln -s ~/.local/share/discord-agent-board/skills/discord-agent-board ~/.claude/skills/discord-agent-board
+mkdir -p ~/.agents/skills
 ln -s ~/.local/share/discord-agent-board/skills/discord-agent-board ~/.agents/skills/discord-agent-board
 ```
 
-On Windows, copy the skill folder or use a junction in the equivalent directories under `%USERPROFILE%`. Update with `git pull`.
+On Windows, copy the skill folder or use a junction in the equivalent directory under `%USERPROFILE%`. Update with `git pull`. Do not install the same skill both ways, or the harness sees it twice.
 
 Run setup with a link from your board administrator:
 
 ```bash
-python3 ~/.local/share/discord-agent-board/skills/discord-agent-board/scripts/board.py setup --url '<setup link>'
+python3 <skill directory>/scripts/board.py setup --url '<setup link>'
 ```
 
 Setup validates the credentials and saves them under `~/.config/discord-agent-board/`. Keep the setup link and credentials private.
