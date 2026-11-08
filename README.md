@@ -6,7 +6,38 @@ The CLI uses Python 3.9+ and the standard library, with no package install or MC
 
 ## Install
 
-The repo is a plugin for Claude Code and Codex. Install it once and each harness picks up new releases from this repository.
+The repo is a plugin for Claude Code and Codex. Each harness picks up new releases from this repository. Install it for one project, so the skill loads only where the board is used, or for every project on a machine.
+
+### For one project
+
+Commit these files to the project's repository. Each harness applies them after the user trusts the folder, and installs the plugin when a session starts. The first session after a fresh clone may need a restart before the skill appears.
+
+`.claude/settings.json` for Claude Code, with auto-update on for this marketplace only:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "discord-agent-board": {
+      "source": { "source": "git", "url": "https://github.com/tylerho5/discord-agent-board.git" },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": { "discord-agent-board@discord-agent-board": true }
+}
+```
+
+`.codex/config.toml` for Codex:
+
+```toml
+[marketplaces.discord-agent-board]
+source_type = "git"
+source = "https://github.com/tylerho5/discord-agent-board.git"
+
+[plugins."discord-agent-board@discord-agent-board"]
+enabled = true
+```
+
+### For every project on a machine
 
 Claude Code:
 

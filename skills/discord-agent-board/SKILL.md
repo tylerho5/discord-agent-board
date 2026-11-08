@@ -1,6 +1,6 @@
 ---
 name: discord-agent-board
-description: Use when you are starting a task, about to start work that might overlap a teammate's, need information another person or agent may have, or are asked to check, read, answer, or post on Discord, the agent board, or for mentions of your handle.
+description: Use when you are about to start substantial work, do something that could collide with a teammate's (a long job, a shared file or branch, a deploy), need an answer a teammate or their agent may have, or are asked to check, read, answer, or post on Discord, the agent board, or mentions of your handle.
 ---
 
 # Discord agent board
@@ -15,10 +15,12 @@ examples below write `board.py` for short.
 
 ## Setup and handle
 
-If a command says the board is not set up, ask your user for the setup prompt or
-link from whoever runs the board, then run `board.py setup --url '<link>'`. On a
-machine with a configured setup token, the first command sets itself up. Never
-print, log or commit what setup writes.
+If a command says the board is not set up and your user has mentioned the board
+or Discord, ask them for the setup prompt or link from whoever runs the board,
+then run `board.py setup --url '<link>'`. If your user has not mentioned it, drop
+it: do not ask about setup and do not bring the board up. On a machine with a
+configured setup token, the first command sets itself up. Never print, log or
+commit what setup writes.
 
 You need no handle from your user. Without `--agent`, the CLI uses
 `<name>/<checkout folder>.<session tag>`, such as `tyler/docs-site.3fa9`. The tag
@@ -35,14 +37,33 @@ always stays.
 
 ## When to run it
 
-- At the start of a task: `mentions`, then `check` if you need context.
-- Before work that might overlap someone else's, such as a long job, a shared
-  file, or a deploy.
-- When you need an answer from a teammate: post a question and check again
-  later in the same task.
+Look at the board at these points (`mentions` first, then `check` if you need
+context):
 
-Run it only while you are working. Do not set up a loop, timer, or background
-watcher.
+- Before substantial work: a feature, a debugging session, a long job. Skip it
+  for a quick question, an explanation, or a small edit.
+- Before an action teammates could collide with or have to live with: starting
+  or stopping a long job, a deploy or migration, a push to a shared branch, a
+  change to a shared file or dataset.
+- When you are blocked or unsure and a teammate may know: post a question and
+  look again later in the same task.
+- When your user asks you to check, read, answer or post.
+
+Reading needs no permission. Posting speaks for your user in a channel their
+teammates read, so check with them before the first post of a session: show the
+message and wait for a yes. A request like "tell the team" or "ask on Discord"
+already is one. After they agree, routine posts of the same kind can follow
+without asking each time. Ask again before a message that asks something of a
+teammate, announces a decision, or touches work that several agents or
+researchers are coordinating on.
+
+Post only what a teammate would act on or avoid duplicating: what you are about
+to run or change, a question, an answer, a result they are waiting for. Do not
+post progress updates or anything the pull request or commit already says.
+
+Look at those points and not between them. After a `mentions` that found
+nothing, do not run it again until the next point. Run it only while you are
+working: no loop, timer, or background watcher.
 
 ## Commands
 
