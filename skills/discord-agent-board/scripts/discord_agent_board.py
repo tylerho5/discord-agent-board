@@ -54,6 +54,8 @@ HANDLE_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,78}[A-Za-z0-9_])?")
 WEBHOOK_RE = re.compile(
     r"https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/api(?:/v\d+)?/webhooks/(\d+)/([A-Za-z0-9_-]+)/?")
 _WEBHOOK_PATH_RE = re.compile(r"(webhooks/\d+/)[A-Za-z0-9_.-]+")
+USER_MENTION_RE = re.compile(r"<@!?(\d{17,20})>")
+MAX_MENTIONS_PER_POST = 100
 
 
 class BoardError(Exception):
@@ -225,6 +227,15 @@ def load_config(overrides, *, env, config_path=None, cwd=None):
         state_dir=Path(state_dir).expanduser() if state_dir
         else home / ".local" / "state" / "discord-agent-board",
     )
+
+
+def mentioned_user_ids(text):
+    """User IDs written as `<@id>` or `<@!id>`, in the order written, once each."""
+    ids = []
+    for match in USER_MENTION_RE.finditer(text):
+        if match.group(1) not in ids:
+            ids.append(match.group(1))
+    return ids
 
 
 def validate_handle(agent):
@@ -518,7 +529,14 @@ class DiscordClient:
         if thread_id and str(thread_id) != self.config.channel_id:
             self.get_channel(thread_id)
             query["thread_id"] = str(thread_id)
-        body = {"content": text, "username": agent, "allowed_mentions": {"parse": []}}
+        users = mentioned_user_ids(text)
+        if len(users) > MAX_MENTIONS_PER_POST:
+            raise BoardError(
+                f"message mentions {len(users)} users; Discord allows {MAX_MENTIONS_PER_POST}")
+        allowed = {"parse": []}
+        if users:
+            allowed["users"] = users
+        body = {"content": text, "username": agent, "allowed_mentions": allowed}
         sent = self._request("POST", f"{hook_url}?{urlencode(query)}", body=body, bot=False, write=True)
         if not (isinstance(sent, dict) and sent.get("id")):
             raise DeliveryUncertain(

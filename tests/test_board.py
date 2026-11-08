@@ -309,6 +309,20 @@ def test_post_is_confirmed_and_labelled(fake, client, thread):
     assert msg["channel_id"] == (thread or BOARD) and msg["id"]
 
 
+@pytest.mark.parametrize("text,users", [
+    ("blocked on <@123456789012345678> for tags", ["123456789012345678"]),
+    ("<@!123456789012345678> and <@123456789012345678>", ["123456789012345678"]),
+    ("ping @ana, @everyone and <@&123456789012345678>", []),
+])
+def test_post_allows_only_user_ids_written_in_the_text(fake, client, text, users):
+    client.post(text, agent="tyler/api-refactor")
+
+    body = fake.sent("POST")[0]["body"]
+    assert body["content"] == text
+    assert body["allowed_mentions"] == ({"parse": [], "users": users} if users
+                                        else {"parse": []})
+
+
 @pytest.mark.parametrize("problem", ["empty", "too-long", "webhook-elsewhere"])
 def test_post_refuses_before_sending(fake, client, problem):
     text = {"empty": "  ", "too-long": "x" * 2001}.get(problem, "hi")
