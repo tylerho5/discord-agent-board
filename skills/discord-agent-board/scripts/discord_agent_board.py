@@ -37,6 +37,7 @@ MAX_PAGES_PER_LOCATION = 20
 MAX_ARCHIVE_PAGES = 10
 FIRST_USE_WINDOW_S = 72 * 3600
 CLOCK_MARGIN_S = 30
+MAX_SNOWFLAKE = (1 << 63) - 1
 CONTEXT_MESSAGES = 5
 MODES = ("check", "mentions")
 
@@ -567,6 +568,11 @@ def _position(state, loc_id):
     return int(state.get("positions", {}).get(loc_id, state.get("floor", 0)))
 
 
+def _was_shown(state, loc_id, mid):
+    """Whether a saved reading state has shown the message: below its position, or listed in ``seen``."""
+    return bool(state) and (mid <= _position(state, loc_id) or str(mid) in state.get("seen", ()))
+
+
 def _author(msg):
     return (msg.get("author") or {}).get("username")
 
@@ -710,14 +716,14 @@ class Board:
                     f"earlier history was not scanned (page it with --before {state['floor']})")
         floor = int(state["floor"])
         positions = {k: int(v) for k, v in state.get("positions", {}).items()}
+        seen = {int(i) for i in state.get("seen", ())}
 
         self.client.server_time = None
         locations, complete = self._discover(state.get("archived_since"), warnings)
         if self.client.server_time is not None:
             now = min(now, self.client.server_time)
-        upper = snowflake_at(now - CLOCK_MARGIN_S)
-        if before is not None:
-            upper = min(upper, int(before) - 1)
+        safe = snowflake_at(now - CLOCK_MARGIN_S)
+        upper = MAX_SNOWFLAKE if before is None else int(before) - 1
 
         shown_by_check = _read_json(self._state_path("check", agent)) if mode == "mentions" else {}
         found, through = [], {}
@@ -730,8 +736,9 @@ class Board:
                 continue
             try:
                 hits, through[loc_id] = self._scan_forward(
-                    location, start, upper, relevant, limit, agent,
-                    seen_upto=_position(shown_by_check, loc_id) if not explicit else None)
+                    location, start, upper, relevant, limit, agent, seen=seen,
+                    shown=(lambda mid, loc=loc_id: _was_shown(shown_by_check, loc, mid))
+                    if not explicit else None)
             except BoardError as err:
                 warnings.append(f"{location.get('name') or loc_id}: {err}")
                 complete = False
@@ -741,7 +748,9 @@ class Board:
         found.sort(key=lambda m: int(m["id"]))
         shown = found[:limit]
         boundary = int(shown[-1]["id"]) if len(found) > limit else upper
-        new_positions = {k: max(positions.get(k, floor), min(boundary, v)) for k, v in through.items()}
+        cap = boundary if explicit else min(boundary, safe)
+        new_positions = {k: max(positions.get(k, floor), min(cap, v)) for k, v in through.items()}
+        shown_ids = seen | {int(m["id"]) for m in shown}
         has_more = len(found) > limit or any(v < upper for v in through.values())
         page = BoardPage(shown, has_more=has_more, warnings=warnings, notes=notes,
                          coverage_complete=complete)
@@ -755,17 +764,19 @@ class Board:
             return page
         if has_more:
             page.continuation = []
-            new_state = dict(state, positions={k: str(v) for k, v in new_positions.items()})
+            new_state = dict(state, positions={k: str(v) for k, v in new_positions.items()},
+                             seen=sorted(str(i) for i in shown_ids if i > floor))
         else:
-            new_state = {"floor": str(upper), "archived_since": snowflake_seconds(upper), "positions": {}}
+            new_state = {"floor": str(safe), "archived_since": snowflake_seconds(safe), "positions": {},
+                         "seen": sorted(str(i) for i in shown_ids if i > safe)}
         page.cursor = (path, new_state)
         return page
 
-    def _scan_forward(self, location, start, upper, relevant, limit, agent, seen_upto=None):
+    def _scan_forward(self, location, start, upper, relevant, limit, agent, seen=(), shown=None):
         cursor, hits, own = start, [], []
 
         def done(through):
-            return (self._unanswered(hits, own, seen_upto) if seen_upto is not None else hits), through
+            return (self._unanswered(hits, own, shown) if shown is not None else hits), through
 
         for _ in range(MAX_PAGES_PER_LOCATION):
             batch = sorted(self.client.get_messages(location["id"], after=str(cursor), limit=FETCH_LIMIT),
@@ -777,7 +788,7 @@ class Board:
                 cursor = mid
                 if msg.get("webhook_id") and _author(msg) == agent:
                     own.append(mid)
-                if msg.get("type", 0) in CONTENT_MESSAGE_TYPES and relevant(msg):
+                if mid not in seen and msg.get("type", 0) in CONTENT_MESSAGE_TYPES and relevant(msg):
                     hits.append(self._normalize(msg, location, agent))
                     if len(hits) >= limit:
                         return done(mid)
@@ -786,11 +797,11 @@ class Board:
         return done(cursor)
 
     @staticmethod
-    def _unanswered(hits, own, seen_upto):
+    def _unanswered(hits, own, shown):
         """Drop a mention only when this handle has been shown it (by ``check``) and has posted
         in the same place since. A mention it was never shown always stays."""
         return [hit for hit in hits
-                if not (int(hit["id"]) <= seen_upto and any(i > int(hit["id"]) for i in own))]
+                if not (shown(int(hit["id"])) and any(i > int(hit["id"]) for i in own))]
 
     def _poll_history(self, relevant, agent, limit, before):
         warnings = []

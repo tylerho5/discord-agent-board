@@ -521,6 +521,75 @@ def test_fast_local_clock_does_not_skip_messages_between_polls(fake, client, con
     assert drain(board, "check", ME) == [mid]
 
 
+def ago(clock, seconds):
+    return str(db.snowflake_at(clock.at - seconds))
+
+
+def live_board(fake, client, config):
+    board, clock = board_for(client, config)
+    fake.clock = clock
+    return board, clock
+
+
+@pytest.mark.parametrize("mode", ["check", "mentions"])
+def test_a_message_posted_seconds_ago_shows_at_once_and_only_once(fake, client, config, mode):
+    board, clock = live_board(fake, client, config)
+    assert drain(board, mode, ME) == []
+    clock.at += 5
+    mid = fake.message(BOARD, ago(clock, 2), f"{PEER}: {ME} ping", author=PEER, webhook=True)["id"]
+
+    assert drain(board, mode, ME) == [mid]
+    clock.at += 5
+    assert drain(board, mode, ME) == []
+    clock.at += 60
+    assert drain(board, mode, ME) == []
+
+
+def test_a_message_stamped_after_the_servers_whole_second_clock_still_shows(fake, client, config):
+    board, clock = live_board(fake, client, config)
+    assert drain(board, "check", ME) == []
+    mid = fake.message(BOARD, ago(clock, -0.9), "same second as the poll")["id"]
+
+    assert drain(board, "check", ME) == [mid]
+
+
+def test_a_message_that_becomes_visible_late_is_still_found(fake, client, config):
+    board, clock = live_board(fake, client, config)
+    assert drain(board, "check", ME) == []
+    clock.at += 20
+    recent = fake.message(BOARD, ago(clock, 3), "visible first")["id"]
+    assert drain(board, "check", ME) == [recent]
+
+    clock.at += 5
+    late = fake.message(BOARD, ago(clock, 12), "older id, indexed late")["id"]
+    assert drain(board, "check", ME) == [late]
+
+
+def test_a_late_message_is_found_after_a_page_cut_inside_the_recent_window(fake, client, config):
+    board, clock = live_board(fake, client, config)
+    assert drain(board, "check", ME) == []
+    clock.at += 20
+    first, second, third = (fake.message(BOARD, ago(clock, s), f"m{s}")["id"] for s in (10, 8, 6))
+
+    page = board.poll("check", agent=ME, limit=2)
+    board.commit(page)
+    assert [m["id"] for m in page.messages] == [first, second] and page.has_more
+    late = fake.message(BOARD, ago(clock, 9), "older id, indexed late")["id"]
+
+    assert drain(board, "check", ME) == [late, third]
+
+
+def test_a_mention_shown_and_answered_within_seconds_leaves_the_inbox(fake, client, config):
+    board, clock = live_board(fake, client, config)
+    assert drain(board, "check", ME) == [] and drain(board, "mentions", ME) == []
+    clock.at += 20
+    fake.message(BOARD, ago(clock, 15), f"{ME} rerun?")
+    assert len(drain(board, "check", ME)) == 1
+    fake.message(BOARD, ago(clock, 10), "rerunning", author=ME, webhook=True)
+
+    assert drain(board, "mentions", ME) == []
+
+
 def test_read_positions_are_isolated(fake, client, config):
     mine = fake.message(BOARD, sf(30), f"@{ME} first")["id"]
     theirs = fake.message(BOARD, sf(29), f"@{PEER} second")["id"]
