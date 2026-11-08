@@ -5,6 +5,7 @@
     board.py mentions
     board.py read https://discord.com/channels/<guild>/<channel>/<message>
     board.py post --text "Starting the index rebuild"
+    board.py post --new-thread "Index rebuild" --text "Starting the rebuild; follow-ups here"
 
 Nothing runs between invocations. Setup and behaviour: README.md.
 """
@@ -72,14 +73,18 @@ def build_parser():
     p = sub.add_parser("post", parents=[common],
                        help="post to the board channel or an existing public thread")
     p.add_argument("--text", help="message text (default: read stdin)")
-    p.add_argument("--thread", type=_snowflake, help="existing public thread ID")
+    where = p.add_mutually_exclusive_group()
+    where.add_argument("--thread", type=_snowflake, help="existing public thread ID")
+    where.add_argument("--new-thread", metavar="NAME",
+                       help="post to the channel and open a public thread on the post")
     return parser
 
 
 def _print_message(message, out, excerpt=False):
     marker = ">>" if message["mentioned"] else "--"
     stamp = (message.get("timestamp") or "")[:16].replace("T", " ")
-    where = f'  in thread "{message["thread_name"]}"' if message.get("thread_id") else ""
+    where = (f'  in thread "{message["thread_name"]}" ({message["thread_id"]})'
+             if message.get("thread_id") else "")
     print(f"{marker} {stamp} UTC  {message['author']}{where}", file=out)
     content = message["content"]
     if excerpt and len(content) > EXCERPT_CHARS:
@@ -135,12 +140,14 @@ def main(argv=None, *, env=None, opener=None):
         b = board.Board(board.DiscordClient(config, opener=opener), config)
         if args.command == "post":
             text = args.text if args.text is not None else sys.stdin.read().rstrip("\n")
-            message = b.post(text, agent=_agent(config), thread_id=args.thread)
-            if args.json:
-                print(json.dumps({"message": message}, ensure_ascii=False, indent=2), file=out)
-            else:
-                print(f"Posted as {message['author']}: {message['url']}", file=out)
-            out.flush()
+            try:
+                message = b.post(text, agent=_agent(config), thread_id=args.thread,
+                                 new_thread=args.new_thread)
+            except board.ThreadNotStarted as error:
+                _print_post(error.message, args, out)
+                print(f"error: {error}", file=err)
+                return 1
+            _print_post(message, args, out)
             return 0
         if args.command == "read":
             page = b.read(args.target, limit=args.limit, before=args.before,
@@ -163,6 +170,17 @@ def main(argv=None, *, env=None, opener=None):
         print(f"error: could not save the reading position: {error}", file=err)
         return 1
     return 0
+
+
+def _print_post(message, args, out):
+    if args.json:
+        print(json.dumps({"message": message}, ensure_ascii=False, indent=2), file=out)
+    else:
+        print(f"Posted as {message['author']}: {message['url']}", file=out)
+        thread = message.get("started_thread")
+        if thread:
+            print(f"Opened thread \"{thread['name']}\" ({thread['id']}): {thread['url']}", file=out)
+    out.flush()
 
 
 def _configure(args, env, err, opener):

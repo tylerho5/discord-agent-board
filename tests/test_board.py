@@ -69,6 +69,7 @@ class FakeDiscord:
         self.webhook = {"id": HOOK_ID, "channel_id": BOARD, "guild_id": GUILD}
         self.requests = []
         self.failures = {}
+        self.threads_allowed = True
         self.clock = time.time
         self.setup = {"channel_id": BOARD, "bot_token": BOT_TOKEN, "webhook_url": WEBHOOK_URL}
 
@@ -141,6 +142,12 @@ class FakeDiscord:
             msg = self.message(target, sf(0, len(self.requests)), body["content"],
                                author=body["username"], webhook=True)
             return 200, msg
+        if method == "POST" and parts[2:3] == ["messages"] and parts[4:] == ["threads"]:
+            if not self.threads_allowed:
+                return 403, {"message": "Missing Permissions"}
+            cid, mid = parts[1], parts[3]
+            self.thread(mid, body["name"], parent=cid)
+            return 201, self.channels[mid]
         assert method == "GET", f"unexpected {method} {path}"
         if parts[0] == "guilds" and parts[2:] == ["threads", "active"]:
             active = [c for c in self.channels.values()
@@ -478,6 +485,29 @@ def test_a_reply_to_the_agents_post_is_a_mention(fake, client, config):
     assert [m["id"] for m in board.poll("mentions", agent=ME).messages] == [reply["id"]]
 
 
+@pytest.mark.parametrize("how", ["started", "posted-in", "opened-on-post"])
+def test_follow_ups_in_the_agents_threads_are_mentions(fake, client, config, how):
+    fake.thread("5000", "plan")
+    fake.thread("6000", "unrelated")
+    board, clock = board_for(client, config, minutes_ago=60)
+    if how == "started":
+        thread = board.post("starting the migration", agent=ME, new_thread="Migration")["started_thread"]["id"]
+    elif how == "posted-in":
+        thread = "5000"
+        board.post("I can take this", agent=ME, thread_id=thread)
+    else:
+        thread = board.post("starting the migration", agent=ME)["id"]
+        fake.thread(thread, "Migration")
+    board = db.Board(client, config, clock=clock)
+    follow_up = fake.message(thread, sf(1), "how long will it take?")["id"]
+    fake.message("6000", sf(1), "unrelated chatter")
+
+    page = board.poll("mentions", agent=ME)
+
+    assert [m["id"] for m in page.messages] == [follow_up] and page.messages[0]["mentioned"]
+    assert board.poll("mentions", agent=PEER).messages == []
+
+
 @pytest.mark.parametrize("person, folder, expected", [
     ("tyler", "discord-board-setup-cmd", "tyler/dc-board-setup-cmd"),
     ("Clyde", "docs-site", "cl/docs-site"),
@@ -739,6 +769,24 @@ def test_cli_post_reports_confirmed_link(fake, run, capsys, as_json):
     posted = fake.messages[BOARD][-1]
     assert f"https://discord.com/channels/{GUILD}/{BOARD}/{posted['id']}" in out
     assert posted["author"]["username"] == ME and HOOK_TOKEN not in out
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_cli_new_thread_opens_a_thread_on_the_post(fake, run, capsys, refused):
+    fake.threads_allowed = not refused
+    status = run("post", "--agent", ME, "--new-thread", "Index  rebuild", "--text", "starting")
+
+    captured = capsys.readouterr()
+    posted = fake.messages[BOARD][-1]
+    assert f"https://discord.com/channels/{GUILD}/{BOARD}/{posted['id']}" in captured.out
+    thread_call = fake.sent("POST")[-1]
+    assert thread_call["body"] == {"name": "Index rebuild"}
+    assert thread_call["headers"]["Authorization"] == f"Bot {BOT_TOKEN}"
+    if refused:
+        assert status == 1 and "Create Public Threads" in captured.err
+    else:
+        assert status == 0 and fake.channels[posted["id"]]["parent_id"] == BOARD
+        assert f"({posted['id']})" in captured.out
 
 
 def test_cli_failures_exit_nonzero_without_state(fake, run, capsys, tmp_path, monkeypatch):

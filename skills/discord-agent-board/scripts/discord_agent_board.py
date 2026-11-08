@@ -40,6 +40,8 @@ CLOCK_MARGIN_S = 30
 MAX_SNOWFLAKE = (1 << 63) - 1
 CONTEXT_MESSAGES = 5
 MODES = ("check", "mentions")
+THREAD_NAME_CHARS = 100
+OWN_THREAD_TTL_S = 30 * 24 * 3600
 
 # env vars that identify the running agent session, most specific first; the first one set wins
 SESSION_ENV = ("DISCORD_BOARD_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "PI_SESSION_ID")
@@ -67,6 +69,14 @@ class NotFound(BoardError):
 
 class DeliveryUncertain(BoardError):
     """A post may or may not have landed; it is never retried automatically."""
+
+
+class ThreadNotStarted(BoardError):
+    """The post landed but its thread could not be opened; ``message`` is the post."""
+
+    def __init__(self, text, message):
+        super().__init__(text)
+        self.message = message
 
 
 @dataclass(frozen=True)
@@ -511,6 +521,18 @@ class DiscordClient:
                 "so check the channel before posting again")
         return sent
 
+    def start_thread(self, message_id, name):
+        """Open a public thread on a board-channel message; the bot needs Create Public Threads."""
+        try:
+            thread = self._request("POST", f"{API}/channels/{self.config.channel_id}/messages/"
+                                           f"{message_id}/threads", body={"name": name})
+        except BoardError as err:
+            if " HTTP 403" in str(err):
+                raise BoardError(f"{err}; the board's bot needs the Create Public Threads "
+                                 "permission in the board channel") from None
+            raise
+        return self._scope(_expect(thread, dict, "a thread"))
+
 
 def _error_payload(err):
     try:
@@ -617,6 +639,7 @@ class Board:
         self.client = client
         self.config = config
         self._clock = clock
+        self._own = {}
 
     # -- shared helpers ----------------------------------------------------
 
@@ -636,8 +659,37 @@ class Board:
             "url": f"https://discord.com/channels/{self.config.guild_id}/{channel_id}/{msg['id']}",
             "thread_id": str(location["id"]) if is_thread else None,
             "thread_name": location.get("name") if is_thread else None,
-            "mentioned": bool(agent and _tags(msg, agent)),
+            "mentioned": bool(agent and self._addressed(msg, location["id"], agent)),
         }
+
+    def _own_threads(self, agent):
+        """Threads the handle started or posted in, and its channel posts that a thread may open on."""
+        if agent not in self._own:
+            try:
+                data = _read_json(self._state_path("threads", agent))
+            except BoardError:
+                data = {}
+            self._own[agent] = {str(k) for k in data.get("threads", {})}
+        return self._own[agent]
+
+    def _remember_thread(self, agent, place_id):
+        path = self._state_path("threads", agent)
+        now = self._clock()
+        try:
+            threads = _read_json(path).get("threads", {})
+        except BoardError:
+            threads = {}
+        threads = {k: v for k, v in threads.items()
+                   if isinstance(v, (int, float)) and v > now - OWN_THREAD_TTL_S}
+        threads[str(place_id)] = now
+        _write_json(path, {"threads": threads})
+        self._own.pop(agent, None)
+
+    def _addressed(self, msg, loc_id, agent, pattern=None):
+        """A tag, a reply to the handle's post, or any message in one of its threads."""
+        if msg.get("webhook_id") and _author(msg) == agent:
+            return False
+        return str(loc_id) in self._own_threads(agent) or _tags(msg, agent, pattern)
 
     def _state_path(self, mode, agent):
         slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", agent)
@@ -690,11 +742,11 @@ class Board:
             raise BoardError("limit must be at least 1")
         pattern = tag_pattern(agent)
         if mode == "check":
-            def relevant(msg):
+            def relevant(msg, loc_id):
                 return True
         else:
-            def relevant(msg):
-                return _tags(msg, agent, pattern)
+            def relevant(msg, loc_id):
+                return self._addressed(msg, loc_id, agent, pattern)
         if before is not None and after is None:
             return self._poll_history(relevant, agent, limit, int(before))
         return self._poll_forward(mode, relevant, agent, limit, before, after)
@@ -788,7 +840,8 @@ class Board:
                 cursor = mid
                 if msg.get("webhook_id") and _author(msg) == agent:
                     own.append(mid)
-                if mid not in seen and msg.get("type", 0) in CONTENT_MESSAGE_TYPES and relevant(msg):
+                if (mid not in seen and msg.get("type", 0) in CONTENT_MESSAGE_TYPES
+                        and relevant(msg, location["id"])):
                     hits.append(self._normalize(msg, location, agent))
                     if len(hits) >= limit:
                         return done(mid)
@@ -815,7 +868,7 @@ class Board:
                     batch = self.client.get_messages(loc_id, before=str(cursor), limit=FETCH_LIMIT)
                     for msg in sorted(batch, key=lambda m: int(m["id"]), reverse=True):
                         cursor = int(msg["id"])
-                        if msg.get("type", 0) in CONTENT_MESSAGE_TYPES and relevant(msg):
+                        if msg.get("type", 0) in CONTENT_MESSAGE_TYPES and relevant(msg, loc_id):
                             hits.append(self._normalize(msg, location, agent))
                             if len(hits) >= limit:
                                 break
@@ -924,7 +977,27 @@ class Board:
 
     # -- post ----------------------------------------------------------------
 
-    def post(self, text, *, agent, thread_id=None):
+    def post(self, text, *, agent, thread_id=None, new_thread=None):
+        if new_thread is not None:
+            new_thread = " ".join(new_thread.split())
+            if thread_id:
+                raise BoardError("pass --thread or --new-thread, not both")
+            if not 1 <= len(new_thread) <= THREAD_NAME_CHARS:
+                raise BoardError(f"a thread name needs 1 to {THREAD_NAME_CHARS} characters")
         message = self.client.post(text, agent=agent, thread_id=thread_id)
         location = self.client.get_channel(thread_id) if thread_id else {"id": self.config.channel_id}
-        return self._normalize(message, location, None)
+        result = self._normalize(message, location, None)
+        try:
+            self._remember_thread(agent, thread_id or result["id"])
+        except OSError:
+            pass
+        if new_thread is not None:
+            try:
+                thread = self.client.start_thread(result["id"], new_thread)
+            except BoardError as err:
+                raise ThreadNotStarted(
+                    f"posted {result['url']}, but the thread was not opened: {err}", result) from None
+            result["started_thread"] = {
+                "id": str(thread["id"]), "name": thread.get("name"),
+                "url": f"https://discord.com/channels/{self.config.guild_id}/{thread['id']}"}
+        return result

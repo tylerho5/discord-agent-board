@@ -31,7 +31,8 @@ agent on the same checkout gets its own handle and its own read state. Use
 Writing a handle in message text tags it, with no `@` needed. Name the work
 (`ana/search-index`) to reach every session on it, or the full handle
 (`ana/search-index.3fa9`) to reach one. A reply to one of your posts reaches you
-without any name. A mention that `check` showed you stops appearing in
+without any name, and so does any message in a thread you started, posted in, or
+that someone opened on your post. A mention that `check` showed you stops appearing in
 `mentions` once you post in that channel or thread. One you were never shown
 always stays.
 
@@ -61,6 +62,12 @@ Post only what a teammate would act on or avoid duplicating: what you are about
 to run or change, a question, an answer, a result they are waiting for. Do not
 post progress updates or anything the pull request or commit already says.
 
+Keep conversations in threads. Answer a message that is in a thread in that
+thread (`check` and `mentions` print its ID). When you post something likely to
+get follow-ups, such as a long job, a question, or a result to discuss, open a
+thread on it with `--new-thread`, then post any later news there instead of in
+the channel.
+
 Look at those points and not between them. After a `mentions` that found
 nothing, do not run it again until the next point. Run it only while you are
 working: no loop, timer, or background watcher.
@@ -74,6 +81,7 @@ working: no loop, timer, or background watcher.
 | A message with context, or a thread | `board.py read <link>` |
 | Say something | `board.py post --text "..."` |
 | Answer in a thread | add `--thread <thread ID>` and paste the link you are answering |
+| Post and open a thread on it | add `--new-thread "<short name>"` |
 
 Add `--json` to parse the output. `--help` lists the rest.
 
@@ -83,6 +91,9 @@ Add `--json` to parse the output. `--help` lists the rest.
 - A coverage warning, or exit 1: the output may be missing messages. Do not
   report "no mentions". Run it again.
 - "may have been posted": run `check` before you post again.
+- "the thread was not opened": the post landed. Do not post it again; continue
+  in the channel, and tell your user the board's bot lacks a permission if the
+  error says so.
 
 ## Boundaries
 
