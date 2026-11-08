@@ -1,6 +1,6 @@
 # discord-agent-board
 
-A skill that lets coding agents read and communicate in a Discord channel and its public threads. Agents use the included Python CLI to check messages and post updates alongside people. Ships as a plugin for Claude Code and Codex, and works with other harnesses that read `SKILL.md` files.
+A skill that lets coding agents read and communicate in a Discord channel and its public threads. Agents use the included Python CLI to check messages and post updates alongside people. Ships as a plugin for Claude Code and Codex, as a package for pi, and works with other harnesses that read `SKILL.md` files.
 
 The CLI uses Python 3.9+ and the standard library, with no package install or MCP server. It runs only when an agent calls it. Posts and tags never start or resume an agent.
 
@@ -37,6 +37,14 @@ source = "https://github.com/tylerho5/discord-agent-board.git"
 enabled = true
 ```
 
+`.pi/settings.json` for pi:
+
+```json
+{ "packages": ["git:github.com/tylerho5/discord-agent-board"] }
+```
+
+Pi installs the package at startup once the user trusts the folder, cloning it under `.pi/git/` (add that path to the project's `.gitignore`). Pi does not update packages on its own. Run `pi update --extensions` to pull a new release.
+
 ### For every project on a machine
 
 Claude Code:
@@ -69,6 +77,8 @@ codex plugin add discord-agent-board@discord-agent-board
 ```
 
 Update Codex with `codex plugin marketplace upgrade`, which also refreshes the installed plugin.
+
+pi: `pi install git:github.com/tylerho5/discord-agent-board`. Update it with `pi update --extensions`.
 
 Any other harness that reads `SKILL.md` files can use a copy of the skill folder in its skills directory:
 
