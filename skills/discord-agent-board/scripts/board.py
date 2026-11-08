@@ -1,9 +1,11 @@
 """Pull-only Discord board for people and their coding agents.
 
     board.py setup --url <setup link>
-    board.py check
-    board.py mentions
-    board.py read https://discord.com/channels/<guild>/<channel>/<message>
+    board.py read                        unread top-level channel messages
+    board.py read <thread>               unread messages in a thread
+    board.py read [<thread>] --recent    the newest messages, read or not
+    board.py read <message link>         one message with its neighbours
+    board.py inbox                       unread messages for you, from anywhere
     board.py post --text "Starting the index rebuild"
     board.py post --new-thread "Index rebuild" --text "Starting the rebuild; follow-ups here"
 
@@ -52,12 +54,9 @@ def build_parser():
         prog="board.py", description=__doc__.split("\n\n")[0],
         epilog="Setup: README.md")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name, text in (("check", "new channel and public-thread messages since your last check"),
-                       ("mentions", "new messages that name your handle")):
-        p = sub.add_parser(name, parents=[common], help=text, description=text)
-        p.add_argument("--limit", type=_limit, default=board.PAGE_LIMIT)
-        p.add_argument("--before", type=_snowflake, help="page older history before this message ID")
-        p.add_argument("--after", type=_snowflake, help="scan history after this message ID")
+    text = "unread messages that tag you, reply to you, or arrive in your threads"
+    p = sub.add_parser("inbox", parents=[common], help=text, description=text)
+    p.add_argument("--limit", type=_limit, default=board.PAGE_LIMIT)
     p = sub.add_parser("setup", help="write the local config from a setup link",
                        description="Fetch the shared board settings from a setup link, check them "
                                    "against Discord, and write the local config files.")
@@ -65,13 +64,19 @@ def build_parser():
                                  "(default: this machine's DISCORD_BOARD_SETUP_URL and token)")
     p.add_argument("--agent", help="save a default handle, e.g. tyler/api-refactor")
     p.add_argument("--config", help="settings file (default ~/.config/discord-agent-board/config.json)")
-    p = sub.add_parser("read", parents=[common], help="a message with context, or a thread's conversation")
-    p.add_argument("target", help="Discord message/thread link, or a thread or board-message ID")
+    text = ("unread messages in the channel's top level or a thread; everything shown counts "
+            "as read")
+    p = sub.add_parser("read", parents=[common], help=text, description=text)
+    p.add_argument("target", nargs="?",
+                   help="thread link or ID, or a message link (default: the channel's top level)")
+    p.add_argument("--recent", action="store_true",
+                   help=f"the newest messages whether read or not (default {board.RECENT_LIMIT})")
+    p.add_argument("--before", type=_snowflake, help="page older messages before this ID (implies --recent)")
     p.add_argument("--thread", type=_snowflake, help="thread holding a bare message ID")
-    p.add_argument("--limit", type=_limit, default=board.PAGE_LIMIT)
-    p.add_argument("--before", type=_snowflake, help="page older thread/channel messages")
+    p.add_argument("--limit", type=_limit, help=f"most messages to show (default {board.PAGE_LIMIT}, "
+                                                  f"or {board.RECENT_LIMIT} with --recent)")
     p = sub.add_parser("post", parents=[common],
-                       help="post to the board channel or an existing public thread")
+                       help="post to the board channel or a public thread, or open a thread")
     p.add_argument("--text", help="message text (default: read stdin)")
     where = p.add_mutually_exclusive_group()
     where.add_argument("--thread", type=_snowflake, help="existing public thread ID")
@@ -80,18 +85,40 @@ def build_parser():
     return parser
 
 
-def _print_message(message, out, excerpt=False):
+def _print_message(message, out, *, excerpt=False, label_new=False, show_thread=True):
     marker = ">>" if message["mentioned"] else "--"
     stamp = (message.get("timestamp") or "")[:16].replace("T", " ")
     where = (f'  in thread "{message["thread_name"]}" ({message["thread_id"]})'
-             if message.get("thread_id") else "")
-    print(f"{marker} {stamp} UTC  {message['author']}{where}", file=out)
+             if show_thread and message.get("thread_id") else "")
+    new = "  (new)" if label_new and message.get("new") else ""
+    print(f"{marker} {stamp} UTC  {message['author']}{where}{new}", file=out)
     content = message["content"]
     if excerpt and len(content) > EXCERPT_CHARS:
         content = content[:EXCERPT_CHARS].rstrip() + " ..."
     for line in content.splitlines() or [""]:
         print(f"   {line}", file=out)
     print(f"   {message['url']}", file=out)
+    thread = message.get("thread")
+    if thread:
+        count = thread.get("message_count")
+        line = f'   -> thread "{thread["name"]}" ({thread["id"]})'
+        if count is not None:
+            line += f": {count} message{'' if count == 1 else 's'}"
+        if thread.get("new") is not None:
+            line += f", {thread['new']}{'+' if thread.get('more_new') else ''} unread"
+        print(line, file=out)
+
+
+def _header(location):
+    if not location or location["type"] != "thread":
+        return None
+    count = location.get("message_count")
+    parts = [f'Thread "{location["name"]}" ({location["id"]})']
+    if count is not None:
+        parts.append(f"{count} message{'' if count == 1 else 's'}")
+    if location.get("subscribed"):
+        parts.append("you follow it")
+    return ", ".join(parts)
 
 
 def _render(page, args, out, err):
@@ -99,10 +126,19 @@ def _render(page, args, out, err):
         json.dump(page.to_json(), out, ensure_ascii=False, indent=2)
         print(file=out)
     else:
+        header = _header(page.location)
+        if header:
+            print(header, file=out)
         for message in page.messages:
-            _print_message(message, out, excerpt=args.command == "mentions")
-        if not page.messages and page.coverage_complete:
-            print("No new messages." if args.command != "read" else "No messages.", file=out)
+            _print_message(message, out, excerpt=page.view == "inbox",
+                           label_new=page.view in ("recent", "context"), show_thread=not header)
+        if not page.messages and page.coverage_complete and not page.has_more:
+            if page.view == "new":
+                where = f" {page.location['id']}" if header else ""
+                print(f"No new messages. `read{where} --recent` shows the last {board.RECENT_LIMIT}.",
+                      file=out)
+            else:
+                print("No new messages." if page.view == "inbox" else "No messages.", file=out)
         if page.has_more:
             if page.continuation:
                 print(f"More remain: rerun with {' '.join(page.continuation)}", file=out)
@@ -113,7 +149,7 @@ def _render(page, args, out, err):
     for warning in page.warnings:
         print(f"warning: {warning}", file=err)
     if not page.coverage_complete:
-        print("warning: coverage incomplete, so mentions may be missing; nothing was marked as "
+        print("warning: coverage incomplete, so messages may be missing; nothing was marked as "
               "read. Run the command again.", file=err)
     out.flush()
 
@@ -150,11 +186,10 @@ def main(argv=None, *, env=None, opener=None):
             _print_post(message, args, out)
             return 0
         if args.command == "read":
-            page = b.read(args.target, limit=args.limit, before=args.before,
-                          thread=args.thread, agent=config.agent)
+            page = b.read(args.target, agent=_agent(config), recent=args.recent, limit=args.limit,
+                          before=args.before, thread=args.thread)
         else:
-            page = b.poll(args.command, agent=_agent(config), limit=args.limit,
-                          before=args.before, after=args.after)
+            page = b.inbox(agent=_agent(config), limit=args.limit)
     except board.BoardError as error:
         print(f"error: {error}", file=err)
         return 1
@@ -222,7 +257,7 @@ def _setup(args, env, out, err, opener):
     if done["agent"]:
         print(f"Handle: {done['agent']} (from your name, this folder and this session; --agent overrides)",
               file=out)
-    print(f"Next: python3 {SCRIPT} mentions", file=out)
+    print(f"Next: python3 {SCRIPT} inbox", file=out)
     out.flush()
     return 0
 

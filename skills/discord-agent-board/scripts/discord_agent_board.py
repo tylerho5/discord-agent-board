@@ -38,8 +38,9 @@ MAX_ARCHIVE_PAGES = 10
 FIRST_USE_WINDOW_S = 72 * 3600
 CLOCK_MARGIN_S = 30
 MAX_SNOWFLAKE = (1 << 63) - 1
+RECENT_LIMIT = 20
 CONTEXT_MESSAGES = 5
-MODES = ("check", "mentions")
+MAX_SEEN = 1000
 THREAD_NAME_CHARS = 100
 OWN_THREAD_TTL_S = 30 * 24 * 3600
 
@@ -455,6 +456,10 @@ class DiscordClient:
             self.board_channel()
         return self._scope(_expect(self._request("GET", f"{API}/channels/{cid}"), dict, "a channel"))
 
+    def refresh_channel(self, channel_id):
+        self._scoped.pop(str(channel_id), None)
+        return self.get_channel(channel_id)
+
     def get_message(self, channel_id, message_id):
         self.get_channel(channel_id)
         return _expect(self._request("GET", f"{API}/channels/{channel_id}/messages/{message_id}"),
@@ -584,19 +589,28 @@ def tag_pattern(agent):
 
 
 def _position(state, loc_id):
-    """The newest message ID in a location that a saved reading position has already shown."""
+    """The newest message ID in a location that a saved reading state has scanned through."""
     if not state:
         return 0
     return int(state.get("positions", {}).get(loc_id, state.get("floor", 0)))
 
 
-def _was_shown(state, loc_id, mid):
-    """Whether a saved reading state has shown the message: below its position, or listed in ``seen``."""
-    return bool(state) and (mid <= _position(state, loc_id) or str(mid) in state.get("seen", ()))
+def _scanned(state, loc_id, mid):
+    """Whether a saved reading state has passed the message: listed in ``seen``, or after the
+    state's first-use cutoff and at or below its position."""
+    if not state:
+        return False
+    if str(mid) in state.get("seen", ()):
+        return True
+    return int(state.get("start", 0)) < mid <= _position(state, loc_id)
 
 
 def _author(msg):
     return (msg.get("author") or {}).get("username")
+
+
+def _own_post(msg, agent):
+    return bool(msg.get("webhook_id")) and _author(msg) == agent
 
 
 def _tags(msg, agent, pattern=None):
@@ -604,7 +618,7 @@ def _tags(msg, agent, pattern=None):
 
     Its own posts never are. A reply to one of its posts is, even without the name.
     """
-    if msg.get("webhook_id") and _author(msg) == agent:
+    if _own_post(msg, agent):
         return False
     parent = msg.get("referenced_message") or {}
     if parent.get("webhook_id") and _author(parent) == agent:
@@ -624,16 +638,22 @@ class BoardPage:
     warnings: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     coverage_complete: bool = True
-    cursor: Optional[Tuple[Path, dict]] = field(default=None, repr=False)
+    view: str = "new"
+    location: Optional[dict] = None
+    writes: List[Tuple[Path, dict]] = field(default_factory=list, repr=False)
 
     def to_json(self):
-        return {"messages": self.messages, "has_more": self.has_more,
-                "continuation": self.continuation, "warnings": self.warnings,
-                "notes": self.notes, "coverage_complete": self.coverage_complete}
+        return {"view": self.view, "location": self.location, "messages": self.messages,
+                "has_more": self.has_more, "continuation": self.continuation,
+                "warnings": self.warnings, "notes": self.notes,
+                "coverage_complete": self.coverage_complete}
 
 
 class Board:
-    """The four board operations over a scoped client and local reading positions."""
+    """Reading views, the inbox and posting, over a scoped client and local reading state.
+
+    Whatever a view shows counts as read for the handle, so no other view shows it again.
+    """
 
     def __init__(self, client, config, *, clock=time.time):
         self.client = client
@@ -650,6 +670,7 @@ class Board:
             content += f"\n[attachment: {attachment.get('filename')} {attachment.get('url')}]"
         is_thread = location.get("type") == PUBLIC_THREAD
         channel_id = str(msg.get("channel_id") or location["id"])
+        started = msg.get("thread")
         return {
             "id": str(msg["id"]),
             "channel_id": channel_id,
@@ -659,45 +680,66 @@ class Board:
             "url": f"https://discord.com/channels/{self.config.guild_id}/{channel_id}/{msg['id']}",
             "thread_id": str(location["id"]) if is_thread else None,
             "thread_name": location.get("name") if is_thread else None,
-            "mentioned": bool(agent and self._addressed(msg, location["id"], agent)),
+            "mentioned": bool(agent and self._addressed(msg, channel_id, agent)),
+            "own": bool(agent and _own_post(msg, agent)),
+            "new": True,
+            "thread": ({"id": str(started["id"]), "name": started.get("name"),
+                        "message_count": started.get("message_count")}
+                       if isinstance(started, dict) and started.get("id") else None),
         }
 
+    def _state_path(self, view, agent):
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", agent)
+        digest = hashlib.sha256(agent.encode("utf-8")).hexdigest()[:8]
+        name = f"{self.config.guild_id}-{self.config.channel_id}-{view}-{slug}-{digest}.json"
+        return Path(self.config.state_dir) / name
+
+    def _load(self, view, agent):
+        return _read_json(self._state_path(view, agent))
+
+    @staticmethod
+    def _fresh_state(now):
+        since = now - FIRST_USE_WINDOW_S
+        floor = str(snowflake_at(since))
+        return {"start": floor, "floor": floor, "archived_since": since, "positions": {}}
+
     def _own_threads(self, agent):
-        """Threads the handle started or posted in, and its channel posts that a thread may open on."""
+        """Places the handle follows, each with the message ID it started following after: threads
+        it started or posted in, and its channel posts, which a thread may later open on."""
         if agent not in self._own:
             try:
-                data = _read_json(self._state_path("threads", agent))
+                data = self._load("threads", agent).get("threads", {})
             except BoardError:
                 data = {}
-            self._own[agent] = {str(k) for k in data.get("threads", {})}
+            self._own[agent] = {str(k): int(v["since"]) for k, v in data.items()
+                                if isinstance(v, dict) and _is_id(str(v.get("since")))}
         return self._own[agent]
 
-    def _remember_thread(self, agent, place_id):
+    def _remember_thread(self, agent, place_id, since):
         path = self._state_path("threads", agent)
         now = self._clock()
         try:
             threads = _read_json(path).get("threads", {})
         except BoardError:
             threads = {}
-        threads = {k: v for k, v in threads.items()
-                   if isinstance(v, (int, float)) and v > now - OWN_THREAD_TTL_S}
-        threads[str(place_id)] = now
+        threads = {k: v for k, v in threads.items() if isinstance(v, dict)
+                   and isinstance(v.get("at"), (int, float)) and v["at"] > now - OWN_THREAD_TTL_S}
+        old = str(threads.get(str(place_id), {}).get("since"))
+        since = str(min(int(old), int(since))) if _is_id(old) else str(since)
+        threads[str(place_id)] = {"since": since, "at": now}
         _write_json(path, {"threads": threads})
         self._own.pop(agent, None)
 
     def _addressed(self, msg, loc_id, agent, pattern=None):
-        """A tag, a reply to the handle's post, or any message in one of its threads."""
-        if msg.get("webhook_id") and _author(msg) == agent:
+        """A tag, a reply to the handle's post, or a later message in one of its threads."""
+        if _own_post(msg, agent):
             return False
-        return str(loc_id) in self._own_threads(agent) or _tags(msg, agent, pattern)
+        since = self._own_threads(agent).get(str(loc_id))
+        if since is not None and int(msg["id"]) > since:
+            return True
+        return _tags(msg, agent, pattern)
 
-    def _state_path(self, mode, agent):
-        slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", agent)
-        digest = hashlib.sha256(agent.encode("utf-8")).hexdigest()[:8]
-        name = f"{self.config.guild_id}-{self.config.channel_id}-{mode}-{slug}-{digest}.json"
-        return Path(self.config.state_dir) / name
-
-    def _discover(self, archived_since, warnings, *, before_id=None):
+    def _discover(self, archived_since, warnings):
         """Board channel plus public threads that can hold messages in the scanned range."""
         locations = {self.config.channel_id: self.client.board_channel()}
         complete = True
@@ -727,57 +769,68 @@ class Board:
         except BoardError as err:
             warnings.append(f"archived thread discovery failed: {err}")
             complete = False
-        if before_id is not None:
-            locations = {k: v for k, v in locations.items()
-                         if k == self.config.channel_id or int(k) < before_id}
         return locations, complete
 
-    # -- check / mentions ----------------------------------------------------
+    # -- unread views: read (new) and inbox ------------------------------------
 
-    def poll(self, mode, *, agent, limit=PAGE_LIMIT, before=None, after=None):
-        if mode not in MODES:
-            raise BoardError(f"unknown mode {mode!r}")
+    def inbox(self, *, agent, limit=PAGE_LIMIT):
+        """Unread messages addressed to the handle, from the channel and every public thread."""
         validate_handle(agent)
-        if limit < 1:
-            raise BoardError("limit must be at least 1")
+        _check_limit(limit)
         pattern = tag_pattern(agent)
-        if mode == "check":
-            def relevant(msg, loc_id):
-                return True
-        else:
-            def relevant(msg, loc_id):
-                return self._addressed(msg, loc_id, agent, pattern)
-        if before is not None and after is None:
-            return self._poll_history(relevant, agent, limit, int(before))
-        return self._poll_forward(mode, relevant, agent, limit, before, after)
+        reads = {}
 
-    def _poll_forward(self, mode, relevant, agent, limit, before, after):
+        def read_state(loc_id):
+            if loc_id not in reads:
+                reads[loc_id] = self._load(f"read-{loc_id}", agent)
+            return reads[loc_id]
+
+        page = self._poll_forward(
+            "inbox", agent, limit,
+            discover=lambda state, warnings: self._discover(state.get("archived_since"), warnings),
+            relevant=lambda msg, loc: self._addressed(msg, loc, agent, pattern),
+            skip=lambda msg, loc: _scanned(read_state(loc), loc, int(msg["id"])),
+            first_note="first inbox for {agent} on this machine: scanned messages since {since}; "
+                       "earlier ones were not scanned")
+        page.view = "inbox"
+        return self._annotate(page, agent)
+
+    def _read_new(self, location, agent, limit):
+        loc_id = str(location["id"])
+        inbox = self._load("inbox", agent)
+
+        def skip(msg, loc):
+            mid = int(msg["id"])
+            return _own_post(msg, agent) or (_scanned(inbox, loc, mid) and (
+                str(mid) in inbox.get("seen", ()) or self._addressed(msg, loc, agent)))
+
+        return self._poll_forward(
+            f"read-{loc_id}", agent, limit,
+            discover=lambda state, warnings: ({loc_id: self.client.refresh_channel(loc_id)}, True),
+            relevant=lambda msg, loc: True, skip=skip,
+            first_note="first read here for {agent} on this machine: showing messages since {since}; "
+                       "use --recent for older ones")
+
+    def _poll_forward(self, view, agent, limit, *, discover, relevant, skip, first_note):
         now = self._clock()
         notes, warnings = [], []
-        path = self._state_path(mode, agent)
-        explicit = after is not None
-        if explicit:
-            state = {"floor": str(after), "archived_since": snowflake_seconds(after), "positions": {}}
-        else:
-            state = _read_json(path)
-            if not state:
-                since = now - FIRST_USE_WINDOW_S
-                state = {"floor": str(snowflake_at(since)), "archived_since": since, "positions": {}}
-                notes.append(
-                    f"first {mode} for {agent} on this machine: scanned messages since {_utc(since)}; "
-                    f"earlier history was not scanned (page it with --before {state['floor']})")
+        path = self._state_path(view, agent)
+        state = _read_json(path) or _read_json(self._state_path(
+            "mentions" if view == "inbox" else "check", agent))
+        if not state:
+            state = self._fresh_state(now)
+            notes.append(first_note.format(agent=agent, since=_utc(state["archived_since"])))
         floor = int(state["floor"])
         positions = {k: int(v) for k, v in state.get("positions", {}).items()}
         seen = {int(i) for i in state.get("seen", ())}
 
         self.client.server_time = None
-        locations, complete = self._discover(state.get("archived_since"), warnings)
+        locations, complete = discover(state, warnings)
         if self.client.server_time is not None:
             now = min(now, self.client.server_time)
         safe = snowflake_at(now - CLOCK_MARGIN_S)
-        upper = MAX_SNOWFLAKE if before is None else int(before) - 1
+        upper = MAX_SNOWFLAKE
 
-        shown_by_check = _read_json(self._state_path("check", agent)) if mode == "mentions" else {}
         found, through = [], {}
         for loc_id in sorted(locations, key=int):
             location = locations[loc_id]
@@ -788,9 +841,7 @@ class Board:
                 continue
             try:
                 hits, through[loc_id] = self._scan_forward(
-                    location, start, upper, relevant, limit, agent, seen=seen,
-                    shown=(lambda mid, loc=loc_id: _was_shown(shown_by_check, loc, mid))
-                    if not explicit else None)
+                    location, start, upper, relevant, skip, limit, agent, seen)
             except BoardError as err:
                 warnings.append(f"{location.get('name') or loc_id}: {err}")
                 complete = False
@@ -800,7 +851,7 @@ class Board:
         found.sort(key=lambda m: int(m["id"]))
         shown = found[:limit]
         boundary = int(shown[-1]["id"]) if len(found) > limit else upper
-        cap = boundary if explicit else min(boundary, safe)
+        cap = min(boundary, safe)
         new_positions = {k: max(positions.get(k, floor), min(cap, v)) for k, v in through.items()}
         shown_ids = seen | {int(m["id"]) for m in shown}
         has_more = len(found) > limit or any(v < upper for v in through.values())
@@ -809,104 +860,72 @@ class Board:
         if not complete:
             page.has_more = False
             return page
-        if explicit:
-            if has_more:
-                resume = str(min(new_positions.values()))
-                page.continuation = ["--after", resume] + (["--before", str(before)] if before else [])
-            return page
+        start = int(state.get("start", 0))
         if has_more:
             page.continuation = []
             new_state = dict(state, positions={k: str(v) for k, v in new_positions.items()},
-                             seen=sorted(str(i) for i in shown_ids if i > floor))
+                             seen=_seen_list(i for i in shown_ids if i > floor or i <= start))
         else:
-            new_state = {"floor": str(safe), "archived_since": snowflake_seconds(safe), "positions": {},
-                         "seen": sorted(str(i) for i in shown_ids if i > safe)}
-        page.cursor = (path, new_state)
+            new_state = {"start": str(start), "floor": str(safe),
+                         "archived_since": snowflake_seconds(safe), "positions": {},
+                         "seen": _seen_list(i for i in shown_ids if i > safe or i <= start)}
+        page.writes.append((path, new_state))
         return page
 
-    def _scan_forward(self, location, start, upper, relevant, limit, agent, seen=(), shown=None):
-        cursor, hits, own = start, [], []
-
-        def done(through):
-            return (self._unanswered(hits, own, shown) if shown is not None else hits), through
-
+    def _scan_forward(self, location, start, upper, relevant, skip, limit, agent, seen):
+        cursor, hits = start, []
         for _ in range(MAX_PAGES_PER_LOCATION):
             batch = sorted(self.client.get_messages(location["id"], after=str(cursor), limit=FETCH_LIMIT),
                            key=lambda m: int(m["id"]))
             for msg in batch:
                 mid = int(msg["id"])
                 if mid > upper:
-                    return done(upper)
+                    return hits, upper
                 cursor = mid
-                if msg.get("webhook_id") and _author(msg) == agent:
-                    own.append(mid)
                 if (mid not in seen and msg.get("type", 0) in CONTENT_MESSAGE_TYPES
-                        and relevant(msg, location["id"])):
+                        and relevant(msg, location["id"]) and not skip(msg, location["id"])):
                     hits.append(self._normalize(msg, location, agent))
                     if len(hits) >= limit:
-                        return done(mid)
+                        return hits, mid
             if len(batch) < FETCH_LIMIT:
-                return done(upper)
-        return done(cursor)
-
-    @staticmethod
-    def _unanswered(hits, own, shown):
-        """Drop a mention only when this handle has been shown it (by ``check``) and has posted
-        in the same place since. A mention it was never shown always stays."""
-        return [hit for hit in hits
-                if not (shown(int(hit["id"])) and any(i > int(hit["id"]) for i in own))]
-
-    def _poll_history(self, relevant, agent, limit, before):
-        warnings = []
-        locations, complete = self._discover(None, warnings, before_id=before)
-        found, lows = [], []
-        for loc_id in sorted(locations, key=int):
-            location = locations[loc_id]
-            cursor, hits, exhausted = before, [], False
-            try:
-                for _ in range(MAX_PAGES_PER_LOCATION):
-                    batch = self.client.get_messages(loc_id, before=str(cursor), limit=FETCH_LIMIT)
-                    for msg in sorted(batch, key=lambda m: int(m["id"]), reverse=True):
-                        cursor = int(msg["id"])
-                        if msg.get("type", 0) in CONTENT_MESSAGE_TYPES and relevant(msg, loc_id):
-                            hits.append(self._normalize(msg, location, agent))
-                            if len(hits) >= limit:
-                                break
-                    if len(hits) >= limit:
-                        break
-                    if len(batch) < FETCH_LIMIT:
-                        exhausted = True
-                        break
-            except BoardError as err:
-                warnings.append(f"{location.get('name') or loc_id}: {err}")
-                complete = False
-                continue
-            found.extend(hits)
-            if not exhausted:
-                lows.append(cursor)
-        found.sort(key=lambda m: int(m["id"]), reverse=True)
-        shown = found[:limit]
-        resume = list(lows)
-        if len(found) > limit:
-            resume.append(int(shown[-1]["id"]))
-        page = BoardPage(sorted(shown, key=lambda m: int(m["id"])), warnings=warnings,
-                         coverage_complete=complete)
-        if resume and complete:
-            page.has_more = True
-            page.continuation = ["--before", str(max(resume))]
-        return page
+                return hits, upper
+        return hits, cursor
 
     def commit(self, page):
-        """Persist an incremental poll's reading position; call after output succeeded."""
-        if not page.cursor:
-            return
-        path, state = page.cursor
-        _write_json(path, state)
+        """Save what a page marked as read; call after its output succeeded."""
+        for path, state in page.writes:
+            _write_json(path, state)
 
     # -- read ----------------------------------------------------------------
 
-    def read(self, target, *, limit=PAGE_LIMIT, before=None, thread=None, agent=None):
-        target = str(target).strip()
+    def read(self, target=None, *, agent, recent=False, limit=None, before=None, thread=None):
+        """The channel's top level or a thread: unread messages by default, or the newest
+        ``limit`` with ``recent``/``before``. A message link shows that message in context."""
+        validate_handle(agent)
+        if limit is not None:
+            _check_limit(limit)
+        if target is None and thread:
+            raise BoardError("--thread names the thread that holds a bare message ID; pass that ID too")
+        if target is None:
+            location, message_id = self.client.board_channel(), None
+        else:
+            location, message_id = self._resolve(str(target).strip(), thread)
+        if message_id:
+            if recent or before is not None:
+                raise BoardError("--recent and --before page a thread or the channel, not a single message")
+            page = self._mark_shown(self._context(location, message_id, limit or PAGE_LIMIT, agent), agent)
+            page.view = "context"
+        elif recent or before is not None:
+            page = self._mark_shown(self._history(location, limit or RECENT_LIMIT, before, agent), agent)
+            page.view = "recent"
+            if page.continuation and location.get("type") == PUBLIC_THREAD:
+                page.continuation.insert(0, str(location["id"]))
+        else:
+            page = self._read_new(location, agent, limit or PAGE_LIMIT)
+        page.location = self._describe(location, agent)
+        return self._annotate(page, agent)
+
+    def _resolve(self, target, thread):
         link = _LINK_RE.fullmatch(target)
         if link:
             guild, channel_id, message_id = link.groups()
@@ -916,12 +935,7 @@ class Board:
             channel_id, message_id = self._resolve_bare_id(target, thread)
         else:
             raise BoardError("read takes a Discord message/thread link or a numeric ID")
-        location = self.client.get_channel(channel_id)
-        if message_id:
-            if before is not None:
-                raise BoardError("--before pages a thread or channel, not a single message")
-            return self._context(location, message_id, limit, agent)
-        return self._history(location, limit, before, agent)
+        return self.client.get_channel(channel_id), message_id
 
     def _resolve_bare_id(self, target, thread):
         if thread:
@@ -941,6 +955,13 @@ class Board:
                 f"{target} is not a thread or a message in the board channel; pass a message link "
                 "(Copy Message Link in Discord) or --thread THREAD_ID") from None
 
+    def _describe(self, location, agent):
+        if location.get("type") != PUBLIC_THREAD:
+            return {"type": "channel", "id": str(location["id"]), "name": location.get("name")}
+        return {"type": "thread", "id": str(location["id"]), "name": location.get("name"),
+                "message_count": location.get("message_count"),
+                "subscribed": str(location["id"]) in self._own_threads(agent)}
+
     def _context(self, location, message_id, limit, agent):
         n = min(CONTEXT_MESSAGES, max(0, (limit - 1) // 2))
         target = self.client.get_message(location["id"], message_id)
@@ -950,12 +971,7 @@ class Board:
             around += self.client.get_messages(location["id"], after=message_id, limit=n)
         around = [m for m in around if m is target or m.get("type", 0) in CONTENT_MESSAGE_TYPES]
         around.sort(key=lambda m: int(m["id"]))
-        notes = []
-        started = target.get("thread")
-        if started:
-            notes.append(f"this message started thread \"{started.get('name')}\": read "
-                         f"https://discord.com/channels/{self.config.guild_id}/{started.get('id')}")
-        return BoardPage([self._normalize(m, location, agent) for m in around], notes=notes)
+        return BoardPage([self._normalize(m, location, agent) for m in around])
 
     def _history(self, location, limit, before, agent):
         batch = self.client.get_messages(location["id"], before=before, limit=min(limit, FETCH_LIMIT))
@@ -975,6 +991,56 @@ class Board:
                 pass
         return page
 
+    def _was_read(self, agent, loc_id, mid, addressed, states):
+        """Whether any view has already shown the handle this message."""
+        def load(view):
+            if view not in states:
+                states[view] = self._load(view, agent)
+            return states[view]
+        if _scanned(load(f"read-{loc_id}"), loc_id, mid):
+            return True
+        inbox = load("inbox")
+        return _scanned(inbox, loc_id, mid) and (addressed or str(mid) in inbox.get("seen", ()))
+
+    def _mark_shown(self, page, agent):
+        """Flag what this page shows for the first time, and record it all as read."""
+        states, fresh = {}, {}
+        for m in page.messages:
+            loc, mid = m["channel_id"], int(m["id"])
+            m["new"] = not (m["own"] or self._was_read(agent, loc, mid, m["mentioned"], states))
+            if m["new"]:
+                fresh.setdefault(loc, set()).add(mid)
+        for loc, ids in fresh.items():
+            state = dict(states.get(f"read-{loc}") or self._fresh_state(self._clock()))
+            state["seen"] = _seen_list({int(i) for i in state.get("seen", ())} | ids)
+            page.writes.append((self._state_path(f"read-{loc}", agent), state))
+        return page
+
+    def _annotate(self, page, agent):
+        """Add subscription and unread counts to the threads that shown messages started."""
+        for m in page.messages:
+            info = m.get("thread")
+            if not info:
+                continue
+            info["subscribed"] = info["id"] in self._own_threads(agent)
+            info["new"] = info["more_new"] = None
+            if info["subscribed"]:
+                try:
+                    info["new"], info["more_new"] = self._thread_unread(info["id"], agent)
+                except BoardError as err:
+                    page.warnings.append(f"thread {info['id']}: could not count unread: {err}")
+        return page
+
+    def _thread_unread(self, thread_id, agent):
+        state = self._load(f"read-{thread_id}", agent) or self._fresh_state(self._clock())
+        batch = self.client.get_messages(thread_id, after=str(_position(state, thread_id)), limit=FETCH_LIMIT)
+        states = {f"read-{thread_id}": state}
+        count = sum(1 for msg in batch
+                    if msg.get("type", 0) in CONTENT_MESSAGE_TYPES and not _own_post(msg, agent)
+                    and not self._was_read(agent, thread_id, int(msg["id"]),
+                                           self._addressed(msg, thread_id, agent), states))
+        return count, len(batch) >= FETCH_LIMIT
+
     # -- post ----------------------------------------------------------------
 
     def post(self, text, *, agent, thread_id=None, new_thread=None):
@@ -988,7 +1054,7 @@ class Board:
         location = self.client.get_channel(thread_id) if thread_id else {"id": self.config.channel_id}
         result = self._normalize(message, location, None)
         try:
-            self._remember_thread(agent, thread_id or result["id"])
+            self._remember_thread(agent, thread_id or result["id"], result["id"])
         except OSError:
             pass
         if new_thread is not None:
@@ -1001,3 +1067,12 @@ class Board:
                 "id": str(thread["id"]), "name": thread.get("name"),
                 "url": f"https://discord.com/channels/{self.config.guild_id}/{thread['id']}"}
         return result
+
+
+def _seen_list(ids):
+    return [str(i) for i in sorted(ids)[-MAX_SEEN:]]
+
+
+def _check_limit(limit):
+    if limit < 1:
+        raise BoardError("limit must be at least 1")
