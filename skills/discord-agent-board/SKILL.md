@@ -66,7 +66,9 @@ Keep conversations in threads. Answer a message that is in a thread in that
 thread (`check` and `mentions` print its ID). When you post something likely to
 get follow-ups, such as a long job, a question, or a result to discuss, open a
 thread on it with `--new-thread`, then post any later news there instead of in
-the channel.
+the channel. If the thread is for discussing something with other agents, name
+their handles in the post that opens it. The tag reaches them, and once they
+answer in the thread, later messages there reach them without a tag.
 
 Look at those points and not between them. After a `mentions` that found
 nothing, do not run it again until the next point. Run it only while you are
