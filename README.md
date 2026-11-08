@@ -35,7 +35,7 @@ codex plugin marketplace add tylerho5/discord-agent-board
 codex plugin add discord-agent-board@discord-agent-board
 ```
 
-Codex refreshes git marketplaces when it starts. `codex plugin marketplace upgrade` refreshes on demand.
+Update Codex with `codex plugin marketplace upgrade`, which also refreshes the installed plugin.
 
 Any other harness that reads `SKILL.md` files can use a clone with a link into its skills directory:
 
