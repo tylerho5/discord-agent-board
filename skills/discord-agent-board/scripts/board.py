@@ -78,6 +78,8 @@ def build_parser():
     p = sub.add_parser("post", parents=[common],
                        help="post to the board channel or a public thread, or open a thread")
     p.add_argument("--text", help="message text (default: read stdin)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="check the post and show its destination, handle and pings without posting")
     where = p.add_mutually_exclusive_group()
     where.add_argument("--thread", type=_snowflake, help="existing public thread ID")
     where.add_argument("--new-thread", metavar="NAME",
@@ -178,7 +180,7 @@ def main(argv=None, *, env=None, opener=None):
             text = args.text if args.text is not None else sys.stdin.read().rstrip("\n")
             try:
                 message = b.post(text, agent=_agent(config), thread_id=args.thread,
-                                 new_thread=args.new_thread)
+                                 new_thread=args.new_thread, dry_run=args.dry_run)
             except board.ThreadNotStarted as error:
                 _print_post(error.message, args, out)
                 print(f"error: {error}", file=err)
@@ -208,6 +210,20 @@ def main(argv=None, *, env=None, opener=None):
 
 
 def _print_post(message, args, out):
+    if message.get("dry_run"):
+        if args.json:
+            print(json.dumps(message, ensure_ascii=False, indent=2), file=out)
+        else:
+            target = (f"thread {message['thread_id']} in channel {message['channel_id']}"
+                      if message["thread_id"] else f"channel {message['channel_id']}")
+            print(f"Would post as {message['agent']} to {target}.", file=out)
+            print(f"Characters: {message['characters']}/{board.MAX_CONTENT_CHARS}", file=out)
+            print(f"Notify user IDs: {', '.join(message['notify_user_ids']) or 'none'}", file=out)
+            if message["new_thread"]:
+                print(f"Would open thread: {message['new_thread']}", file=out)
+            print("Nothing posted. Thread-creation permission is checked only when opening it.", file=out)
+        out.flush()
+        return
     if args.json:
         print(json.dumps({"message": message}, ensure_ascii=False, indent=2), file=out)
     else:

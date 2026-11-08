@@ -847,6 +847,42 @@ def test_cli_new_thread_opens_a_thread_on_the_post(fake, run, capsys, refused):
         assert f"({posted['id']})" in captured.out
 
 
+@pytest.mark.parametrize("destination", ["channel", "thread", "new-thread"])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_cli_dry_run_previews_post_without_writing(fake, run, capsys, tmp_path, destination, as_json):
+    fake.thread("5000", "Topic")
+    options = {"channel": [], "thread": ["--thread", "5000"],
+               "new-thread": ["--new-thread", "New topic"]}[destination]
+    text = "<@123456789012345678> please check"
+
+    assert run("post", "--agent", ME, "--text", text, "--dry-run", *options,
+               *(["--json"] if as_json else [])) == 0
+
+    out = capsys.readouterr().out
+    if as_json:
+        assert json.loads(out) == {"dry_run": True, "agent": ME, "channel_id": BOARD,
+                                   "thread_id": "5000" if destination == "thread" else None,
+                                   "new_thread": "New topic" if destination == "new-thread" else None,
+                                   "characters": len(text), "notify_user_ids": ["123456789012345678"]}
+    else:
+        assert ME in out and BOARD in out and f"{len(text)}/2000" in out
+        assert "123456789012345678" in out and "Nothing posted" in out
+        if destination == "thread":
+            assert "thread 5000" in out
+        if destination == "new-thread":
+            assert "New topic" in out
+    assert not fake.sent("POST") and not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize("options", [
+    ["--text", "x" * 2001], ["--text", "ok", "--thread", OTHER],
+    ["--text", "ok", "--new-thread", " "],
+])
+def test_cli_dry_run_refuses_invalid_posts(fake, run, capsys, options):
+    assert run("post", "--agent", ME, "--dry-run", *options) == 1
+    assert "error:" in capsys.readouterr().err and not fake.sent("POST")
+
+
 def test_cli_read_shows_threads_and_marks_what_was_already_read(fake, run, capsys):
     starter = fake.message(BOARD, sf(10), "topic")["id"]
     fake.thread(starter, "Topic")
@@ -941,6 +977,26 @@ def test_default_handle_is_the_person_and_the_checkout_folder(tmp_path, person, 
     cfg = db.load_config({"agent": agent}, env=env, cwd=checkout(tmp_path) / "src")
 
     assert cfg.agent == expected
+
+
+@pytest.mark.parametrize("session_var", db.SESSION_ENV)
+def test_default_handle_survives_directory_changes_in_one_session(tmp_path, session_var):
+    home = tmp_path / "home"
+    env = {"HOME": str(home), "USER": "Ana", session_var: "session-one"}
+    project = checkout(tmp_path)
+    temp = tmp_path / "temp"
+    temp.mkdir()
+
+    first = db.load_config({}, env=env, cwd=project)
+    moved = db.load_config({}, env=env, cwd=temp)
+    explicit = db.load_config({"agent": "ana/other"}, env=env, cwd=temp)
+    again = db.load_config({}, env=env, cwd=temp)
+    other = db.load_config({}, env={**env, session_var: "session-two"}, cwd=temp)
+
+    assert moved.agent == again.agent == first.agent
+    assert first.agent.startswith("ana/docs-site.")
+    assert explicit.agent == "ana/other" and other.agent.startswith("ana/temp.")
+    assert other.agent != first.agent
 
 
 @pytest.fixture
