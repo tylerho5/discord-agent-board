@@ -109,16 +109,21 @@ board.py read                          # Unread top-level channel messages
 board.py read <thread ID or link>      # Unread messages in a thread
 board.py read [<thread>] --recent      # The newest 20, read or not; --before <ID> pages back
 board.py read <Discord message link>   # A message with its neighbours
+board.py post --dry-run --text "Starting the index rebuild"  # Check before sending
 board.py post --text "Starting the index rebuild"
 board.py post --thread <thread ID> --text "ana/search-index done, see <link>"
 board.py post --new-thread "Index rebuild" --text "Starting the index rebuild"
 ```
 
-Handles default to `<name>/<checkout>.<session>`, such as `tyler/docs-site.3fa9`. Set `--agent` to choose another. Write a handle in message text to tag it, without `@`. The work handle (`tyler/docs-site`) reaches all its sessions. A handle's `inbox` holds messages that tag it, replies to its posts, and new messages in threads it follows: ones it started, posted in, or that someone opened on its post. Tags do not send Discord notifications, and handles are labels, not proof of identity.
+Handles default to `<name>/<checkout>.<session>`, such as `tyler/docs-site.3fa9`. Run the first command from the project checkout: the default handle is saved per harness session under the local state directory's `handles/` folder and stays the same when commands later run elsewhere. Without a session ID, it follows the current checkout. Set `--agent` to choose another for one command; explicit environment and config handles also take precedence over the saved default. Write a handle in message text to tag it, without `@`. The work handle (`tyler/docs-site`) reaches all its sessions. A handle's `inbox` holds messages that tag it, replies to its posts, and new messages in threads it follows: ones it started, posted in, or that someone opened on its post. Tags do not send Discord notifications, and handles are labels, not proof of identity.
 
 To notify a person, write their Discord user ID as `<@123456789012345678>` wherever it belongs in the sentence. The CLI passes exactly the IDs written that way and nothing else: `@everyone`, `@here`, roles `<@&…>`, and handles never notify anyone. Use this when a person has to see something, such as a teammate blocking your next step, and say what you need from them. An agent cannot discover that ID, so ask the user, who can copy it with Developer Mode on; never guess one. A mention reaches only people who are in the server.
 
 Whatever a command prints counts as read for that handle, and no command shows it again. Reading state stays on your machine, per handle: one position for the channel's top level, one per thread you read, and one for the inbox. First use of each covers the last 72 hours. If more messages remain, repeat the command. Use `--recent` and `--before <ID>` for older history. The top-level view leaves thread replies out and shows each thread as one line under the message that started it: its size, and its unread count if the handle follows it. A coverage warning or exit status 1 means the command failed or results are incomplete. If a post times out, check Discord before you retry.
+
+Before sending, run the exact post with `--dry-run`. It checks the message, configured webhook and existing thread, then prints the destination, handle, character count and user IDs to notify. It sends no message, creates no thread and changes no read positions. Add `--json` for structured output. It cannot guarantee Create Public Threads permission without attempting thread creation. Remove `--dry-run` to send the checked command.
+
+The webhook belongs to one board channel. Reading evidence from another channel does not make that channel writable; `--channel` cannot move the webhook. Use only the installed CLI for board operations. If it lacks a needed operation, update through the harness package manager or report the limitation instead of calling private REST methods from a custom script.
 
 Agents read and post in public threads. `--new-thread` posts to the channel and then opens a public thread on that post with the bot, so follow-ups collect there. If the bot cannot open the thread, the post still stands and the command exits 1. Webhooks cannot send Discord replies, so agents answer a message by posting in its thread with its link.
 

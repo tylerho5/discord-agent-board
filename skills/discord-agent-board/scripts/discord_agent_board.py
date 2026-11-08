@@ -185,6 +185,24 @@ def derive_handle(person, env, cwd):
     return handle if handle and HANDLE_RE.fullmatch(handle) else None
 
 
+def session_handle(person, env, cwd, state_dir):
+    session = next((f"{name}:{env[name].strip()}" for name in SESSION_ENV
+                    if (env.get(name) or "").strip()), None)
+    if not session:
+        return derive_handle(person, env, cwd)
+    path = state_dir / "handles" / (hashlib.sha256(session.encode()).hexdigest() + ".json")
+    saved = _read_json(path).get("agent")
+    if saved:
+        return validate_handle(saved)
+    agent = derive_handle(person, env, cwd)
+    if agent:
+        try:
+            _write_json(path, {"agent": agent})
+        except OSError as err:
+            raise BoardError(f"cannot save the session's board handle: {err.strerror}") from None
+    return agent
+
+
 def settings_path_for(env, config_path=None):
     home = Path(env["HOME"]) if env.get("HOME") else Path.home()
     return Path(config_path or home / ".config" / "discord-agent-board" / "config.json")
@@ -216,16 +234,17 @@ def load_config(overrides, *, env, config_path=None, cwd=None):
     if not bot_token:
         bot_token = _read_json(home / ".config" / "mcp-discord" / "config.json").get("botToken")
     state_dir = pick("state_dir", "DISCORD_BOARD_STATE_DIR")
-    agent = pick("agent", "DISCORD_BOARD_AGENT") or derive_handle(
-        settings.get("person"), env, cwd or Path.cwd())
+    state_dir = (Path(state_dir).expanduser() if state_dir
+                 else home / ".local" / "state" / "discord-agent-board")
+    agent = pick("agent", "DISCORD_BOARD_AGENT") or session_handle(
+        settings.get("person"), env, cwd or Path.cwd(), state_dir)
     return BoardConfig(
         guild_id=pick("guild_id", "DISCORD_BOARD_GUILD_ID"),
         channel_id=pick("channel_id", "DISCORD_BOARD_CHANNEL_ID"),
         agent=agent,
         bot_token=bot_token or None,
         webhook_url=env.get("DISCORD_BOARD_WEBHOOK_URL") or creds.get("webhook_url") or None,
-        state_dir=Path(state_dir).expanduser() if state_dir
-        else home / ".local" / "state" / "discord-agent-board",
+        state_dir=state_dir,
     )
 
 
@@ -518,7 +537,7 @@ class DiscordClient:
             raise ScopeError("the configured webhook does not belong to the board channel")
         return hook_url
 
-    def post(self, text, *, agent, thread_id=None):
+    def post(self, text, *, agent, thread_id=None, dry_run=False):
         if not text or not text.strip():
             raise BoardError("refusing to post an empty message")
         if len(text) > MAX_CONTENT_CHARS:
@@ -537,6 +556,10 @@ class DiscordClient:
         if users:
             allowed["users"] = users
         body = {"content": text, "username": agent, "allowed_mentions": allowed}
+        if dry_run:
+            return {"dry_run": True, "agent": agent, "channel_id": self.config.channel_id,
+                    "thread_id": query.get("thread_id"), "characters": len(text),
+                    "notify_user_ids": users}
         sent = self._request("POST", f"{hook_url}?{urlencode(query)}", body=body, bot=False, write=True)
         if not (isinstance(sent, dict) and sent.get("id")):
             raise DeliveryUncertain(
@@ -1061,14 +1084,16 @@ class Board:
 
     # -- post ----------------------------------------------------------------
 
-    def post(self, text, *, agent, thread_id=None, new_thread=None):
+    def post(self, text, *, agent, thread_id=None, new_thread=None, dry_run=False):
         if new_thread is not None:
             new_thread = " ".join(new_thread.split())
             if thread_id:
                 raise BoardError("pass --thread or --new-thread, not both")
             if not 1 <= len(new_thread) <= THREAD_NAME_CHARS:
                 raise BoardError(f"a thread name needs 1 to {THREAD_NAME_CHARS} characters")
-        message = self.client.post(text, agent=agent, thread_id=thread_id)
+        message = self.client.post(text, agent=agent, thread_id=thread_id, dry_run=dry_run)
+        if dry_run:
+            return {**message, "new_thread": new_thread}
         location = self.client.get_channel(thread_id) if thread_id else {"id": self.config.channel_id}
         result = self._normalize(message, location, None)
         try:
