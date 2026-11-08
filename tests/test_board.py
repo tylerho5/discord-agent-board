@@ -69,6 +69,7 @@ class FakeDiscord:
         self.webhook = {"id": HOOK_ID, "channel_id": BOARD, "guild_id": GUILD}
         self.requests = []
         self.failures = {}
+        self.threads_allowed = True
         self.clock = time.time
         self.setup = {"channel_id": BOARD, "bot_token": BOT_TOKEN, "webhook_url": WEBHOOK_URL}
 
@@ -141,6 +142,12 @@ class FakeDiscord:
             msg = self.message(target, sf(0, len(self.requests)), body["content"],
                                author=body["username"], webhook=True)
             return 200, msg
+        if method == "POST" and parts[2:3] == ["messages"] and parts[4:] == ["threads"]:
+            if not self.threads_allowed:
+                return 403, {"message": "Missing Permissions"}
+            cid, mid = parts[1], parts[3]
+            self.thread(mid, body["name"], parent=cid)
+            return 201, self.channels[mid]
         assert method == "GET", f"unexpected {method} {path}"
         if parts[0] == "guilds" and parts[2:] == ["threads", "active"]:
             active = [c for c in self.channels.values()
@@ -150,7 +157,10 @@ class FakeDiscord:
         if cid not in self.channels:
             return 404, {"message": "Unknown Channel"}
         if len(parts) == 2:
-            return 200, self.channels[cid]
+            channel = self.channels[cid]
+            if channel["type"] == 11:
+                channel = dict(channel, message_count=len(self.messages[cid]))
+            return 200, channel
         if parts[2:] == ["threads", "archived", "public"]:
             rows = sorted(
                 (c for c in self.channels.values() if c["type"] == 11
@@ -160,7 +170,7 @@ class FakeDiscord:
                 rows = [c for c in rows if c["thread_metadata"]["archive_timestamp"] < q["before"]]
             limit = int(q.get("limit", 50))
             return 200, {"threads": rows[:limit], "members": [], "has_more": len(rows) > limit}
-        msgs = sorted(self.messages[cid], key=lambda m: int(m["id"]))
+        msgs = sorted((self.with_thread(m) for m in self.messages[cid]), key=lambda m: int(m["id"]))
         if len(parts) == 4:
             hit = [m for m in msgs if m["id"] == parts[3]]
             return (200, hit[0]) if hit else (404, {"message": "Unknown Message"})
@@ -172,6 +182,12 @@ class FakeDiscord:
                 msgs = [m for m in msgs if int(m["id"]) < int(q["before"])]
             page = msgs[-limit:]
         return 200, list(reversed(page))
+
+    def with_thread(self, msg):
+        thread = self.channels.get(msg["id"])
+        if not thread or thread.get("parent_id") != msg["channel_id"]:
+            return msg
+        return dict(msg, thread=dict(thread, message_count=len(self.messages[msg["id"]])))
 
     def sent(self, method=None):
         return [r for r in self.requests if method is None or r["method"] == method]
@@ -359,10 +375,16 @@ def board_for(client, config, minutes_ago=0):
     return db.Board(client, config, clock=clock), clock
 
 
-def drain(board, mode, agent, limit=50):
+def view(board, where, agent, limit=50):
+    if where == "inbox":
+        return board.inbox(agent=agent, limit=limit)
+    return board.read(None if where == BOARD else where, agent=agent, limit=limit)
+
+
+def drain(board, where, agent, limit=50):
     seen = []
     for _ in range(20):
-        page = board.poll(mode, agent=agent, limit=limit)
+        page = view(board, where, agent, limit)
         assert page.coverage_complete, page.warnings
         seen += [m["id"] for m in page.messages]
         board.commit(page)
@@ -383,8 +405,8 @@ def test_poll_surfaces_messages_that_name_the_handle(fake, client, config, webho
     ids = [fake.message(where, sf(30 - i), text, webhook=webhook)["id"] for i, (text, _) in enumerate(cases)]
     board, _ = board_for(client, config)
 
-    mentions = board.poll("mentions", agent=ME)
-    check = board.poll("check", agent=ME)
+    mentions = board.inbox(agent=ME)
+    check = view(board, where, ME)
 
     wanted = [mid for mid, (_, hit) in zip(ids, cases) if hit]
     assert [m["id"] for m in mentions.messages] == wanted
@@ -400,7 +422,7 @@ def test_poll_surfaces_messages_that_name_the_handle(fake, client, config, webho
 def test_handles_must_be_name_slash_work(fake, client, config, handle):
     board, _ = board_for(client, config)
     with pytest.raises(db.BoardError, match="handle"):
-        board.poll("mentions", agent=handle)
+        board.inbox(agent=handle)
 
 
 SESSION_A, SESSION_B = "tyler/docs-site.aaaa", "tyler/docs-site.bbbb"
@@ -431,41 +453,35 @@ def test_sessions_of_one_work_share_its_name_but_not_read_state(fake, client, co
     to_a = fake.message(BOARD, sf(37), f"{SESSION_A} only you")["id"]
     board, _ = board_for(client, config)
 
-    first_a = board.poll("mentions", agent=SESSION_A)
+    first_a = board.inbox(agent=SESSION_A)
     board.commit(first_a)
     assert [m["id"] for m in first_a.messages] == [to_work, to_a]
-    assert board.poll("mentions", agent=SESSION_A).messages == []
-    assert [m["id"] for m in board.poll("mentions", agent=SESSION_B).messages] == [started, to_b, to_work]
+    assert board.inbox(agent=SESSION_A).messages == []
+    assert [m["id"] for m in board.inbox(agent=SESSION_B).messages] == [started, to_b, to_work]
 
 
-def test_a_mention_leaves_the_inbox_only_after_the_agent_was_shown_it_and_answered(fake, client, config):
+@pytest.mark.parametrize("first", ["read", "recent", "inbox", "context"])
+def test_a_message_any_view_showed_is_not_shown_again(fake, client, config, first):
     fake.thread("5000", "plan")
-    asked = fake.message(BOARD, sf(75), f"{ME} rerun the build?")["id"]
-    fake.message(BOARD, sf(74), "rerunning now", author=ME, webhook=True)
-    still_open = fake.message(BOARD, sf(73), f"{ME} and the eval?")["id"]
-    board, clock = board_for(client, config, minutes_ago=60)
-    first = board.poll("check", agent=ME)
-    board.commit(first)
-    assert asked in [m["id"] for m in first.messages]
+    tagged = fake.message(BOARD, sf(30), f"{ME} rerun the build?")["id"]
+    chatter = fake.message(BOARD, sf(29), "lunch?")["id"]
+    in_thread = fake.message("5000", sf(28), f"{ME} and the eval?")["id"]
+    board, _ = board_for(client, config)
+    if first == "read":
+        page = board.read(agent=ME)
+    elif first == "recent":
+        page = board.read(agent=ME, recent=True)
+    elif first == "context":
+        page = board.read(f"https://discord.com/channels/{GUILD}/{BOARD}/{tagged}", agent=ME)
+    else:
+        page = board.inbox(agent=ME)
+    board.commit(page)
+    shown = {m["id"] for m in page.messages}
 
-    clock.at += 3600
-    never_shown = fake.message("5000", sf(30), f"{ME} thoughts?")["id"]
-    fake.message("5000", sf(29), "on it", author=ME, webhook=True)
+    again = drain(board, "inbox", ME) + drain(board, BOARD, ME) + drain(board, "5000", ME)
 
-    ids = [m["id"] for m in board.poll("mentions", agent=ME).messages]
-    assert ids == [still_open, never_shown] and asked not in ids
-
-
-def test_a_siblings_answer_does_not_clear_another_sessions_mentions(fake, client, config):
-    asked = fake.message(BOARD, sf(75), "tyler/docs-site rerun the build?")["id"]
-    fake.message(BOARD, sf(74), "taking it", author=SESSION_B, webhook=True)
-    board, clock = board_for(client, config, minutes_ago=60)
-    for session in (SESSION_A, SESSION_B):
-        board.commit(board.poll("check", agent=session))
-    clock.at += 3600
-
-    assert [m["id"] for m in board.poll("mentions", agent=SESSION_A).messages] == [asked]
-    assert board.poll("mentions", agent=SESSION_B).messages == []
+    assert sorted(again) == sorted({tagged, chatter, in_thread} - shown)
+    assert not any(m["new"] for m in board.read(agent=ME, recent=True).messages)
 
 
 def test_a_reply_to_the_agents_post_is_a_mention(fake, client, config):
@@ -475,7 +491,66 @@ def test_a_reply_to_the_agents_post_is_a_mention(fake, client, config):
     fake.message(BOARD, sf(48), "unrelated chatter")
     board, _ = board_for(client, config)
 
-    assert [m["id"] for m in board.poll("mentions", agent=ME).messages] == [reply["id"]]
+    assert [m["id"] for m in board.inbox(agent=ME).messages] == [reply["id"]]
+
+
+@pytest.mark.parametrize("how", ["started", "posted-in", "opened-on-post"])
+def test_follow_ups_in_the_agents_threads_are_mentions(fake, client, config, how):
+    fake.thread("5000", "plan")
+    fake.thread("6000", "unrelated")
+    board, clock = board_for(client, config, minutes_ago=60)
+    if how == "started":
+        thread = board.post("starting the migration", agent=ME, new_thread="Migration")["started_thread"]["id"]
+    elif how == "posted-in":
+        thread = "5000"
+        fake.message(thread, sf(90), "before the agent joined")
+        board.post("I can take this", agent=ME, thread_id=thread)
+    else:
+        thread = board.post("starting the migration", agent=ME)["id"]
+        fake.thread(thread, "Migration")
+    board = db.Board(client, config, clock=clock)
+    follow_up = fake.message(thread, sf(-1), "how long will it take?")["id"]
+    fake.message("6000", sf(-1), "unrelated chatter")
+
+    page = board.inbox(agent=ME)
+
+    assert [m["id"] for m in page.messages] == [follow_up] and page.messages[0]["mentioned"]
+    assert board.inbox(agent=PEER).messages == []
+
+
+def test_thread_starters_show_their_size_and_unread_count_only_when_followed(fake, client, config):
+    board, clock = board_for(client, config, minutes_ago=60)
+    mine = board.post("starting the rebuild", agent=ME, new_thread="Rebuild")["started_thread"]["id"]
+    for i in range(2):
+        fake.message(mine, sf(-1, i), f"question {i}")
+    theirs = fake.message(BOARD, sf(10), "someone else's topic")["id"]
+    fake.thread(theirs, "Theirs")
+    fake.message(theirs, sf(9), "a reply")
+    board = db.Board(client, config, clock=clock)
+
+    threads = {m["thread"]["name"]: m["thread"] for m in board.read(agent=ME, recent=True).messages
+               if m["thread"]}
+    assert threads["Rebuild"] | {"id": mine} == {
+        "id": mine, "name": "Rebuild", "message_count": 2, "subscribed": True, "new": 2, "more_new": False}
+    assert threads["Theirs"]["message_count"] == 1 and threads["Theirs"]["new"] is None
+
+    page = board.read(mine, agent=ME)
+    board.commit(page)
+    assert page.location["subscribed"] and len(page.messages) == 2
+    after = [m["thread"] for m in board.read(agent=ME, recent=True).messages if m["thread"]]
+    assert [t["new"] for t in after if t["id"] == mine] == [0]
+
+
+def test_an_old_message_shown_by_recent_stays_read_after_the_view_catches_up(fake, client, config):
+    early, _ = board_for(client, config, minutes_ago=60 * 24 * 10)
+    early.commit(early.inbox(agent=ME))
+    old = fake.message(BOARD, sf(60 * 24 * 5), f"{ME} still around?")["id"]
+    board, _ = board_for(client, config)
+
+    board.commit(board.read(agent=ME, recent=True))
+    board.commit(board.read(agent=ME))
+
+    assert drain(board, "inbox", ME) == [] and old not in drain(board, BOARD, ME)
 
 
 @pytest.mark.parametrize("person, folder, expected", [
@@ -502,7 +577,7 @@ def test_a_handle_does_not_see_its_own_posts_as_mentions(fake, client, config):
     peer = fake.message(BOARD, sf(29), f"{PEER}: waiting on {ME}", author=PEER, webhook=True)["id"]
     board, _ = board_for(client, config)
 
-    page = board.poll("mentions", agent=ME)
+    page = board.inbox(agent=ME)
 
     assert [m["id"] for m in page.messages] == [peer] and own not in [m["id"] for m in page.messages]
 
@@ -512,13 +587,13 @@ def test_fast_local_clock_does_not_skip_messages_between_polls(fake, client, con
     fake.clock = server_clock
     board, local_clock = board_for(client, config)
     local_clock.at = server_clock.at + 120
-    assert drain(board, "check", ME) == []
+    assert drain(board, BOARD, ME) == []
 
     mid = fake.message(BOARD, str(db.snowflake_at(server_clock.at)), "new message")["id"]
     server_clock.at += 60
     local_clock.at += 60
 
-    assert drain(board, "check", ME) == [mid]
+    assert drain(board, BOARD, ME) == [mid]
 
 
 def ago(clock, seconds):
@@ -531,7 +606,7 @@ def live_board(fake, client, config):
     return board, clock
 
 
-@pytest.mark.parametrize("mode", ["check", "mentions"])
+@pytest.mark.parametrize("mode", [BOARD, "inbox"])
 def test_a_message_posted_seconds_ago_shows_at_once_and_only_once(fake, client, config, mode):
     board, clock = live_board(fake, client, config)
     assert drain(board, mode, ME) == []
@@ -547,47 +622,46 @@ def test_a_message_posted_seconds_ago_shows_at_once_and_only_once(fake, client, 
 
 def test_a_message_stamped_after_the_servers_whole_second_clock_still_shows(fake, client, config):
     board, clock = live_board(fake, client, config)
-    assert drain(board, "check", ME) == []
+    assert drain(board, BOARD, ME) == []
     mid = fake.message(BOARD, ago(clock, -0.9), "same second as the poll")["id"]
 
-    assert drain(board, "check", ME) == [mid]
+    assert drain(board, BOARD, ME) == [mid]
 
 
 def test_a_message_that_becomes_visible_late_is_still_found(fake, client, config):
     board, clock = live_board(fake, client, config)
-    assert drain(board, "check", ME) == []
+    assert drain(board, BOARD, ME) == []
     clock.at += 20
     recent = fake.message(BOARD, ago(clock, 3), "visible first")["id"]
-    assert drain(board, "check", ME) == [recent]
+    assert drain(board, BOARD, ME) == [recent]
 
     clock.at += 5
     late = fake.message(BOARD, ago(clock, 12), "older id, indexed late")["id"]
-    assert drain(board, "check", ME) == [late]
+    assert drain(board, BOARD, ME) == [late]
 
 
 def test_a_late_message_is_found_after_a_page_cut_inside_the_recent_window(fake, client, config):
     board, clock = live_board(fake, client, config)
-    assert drain(board, "check", ME) == []
+    assert drain(board, BOARD, ME) == []
     clock.at += 20
     first, second, third = (fake.message(BOARD, ago(clock, s), f"m{s}")["id"] for s in (10, 8, 6))
 
-    page = board.poll("check", agent=ME, limit=2)
+    page = view(board, BOARD, ME, limit=2)
     board.commit(page)
     assert [m["id"] for m in page.messages] == [first, second] and page.has_more
     late = fake.message(BOARD, ago(clock, 9), "older id, indexed late")["id"]
 
-    assert drain(board, "check", ME) == [late, third]
+    assert drain(board, BOARD, ME) == [late, third]
 
 
-def test_a_mention_shown_and_answered_within_seconds_leaves_the_inbox(fake, client, config):
+def test_a_mention_read_seconds_after_it_was_posted_stays_out_of_the_inbox(fake, client, config):
     board, clock = live_board(fake, client, config)
-    assert drain(board, "check", ME) == [] and drain(board, "mentions", ME) == []
+    assert drain(board, BOARD, ME) == [] and drain(board, "inbox", ME) == []
     clock.at += 20
     fake.message(BOARD, ago(clock, 15), f"{ME} rerun?")
-    assert len(drain(board, "check", ME)) == 1
-    fake.message(BOARD, ago(clock, 10), "rerunning", author=ME, webhook=True)
+    assert len(drain(board, BOARD, ME)) == 1
 
-    assert drain(board, "mentions", ME) == []
+    assert drain(board, "inbox", ME) == []
 
 
 def test_read_positions_are_isolated(fake, client, config):
@@ -595,18 +669,18 @@ def test_read_positions_are_isolated(fake, client, config):
     theirs = fake.message(BOARD, sf(29), f"@{PEER} second")["id"]
     board, _ = board_for(client, config)
 
-    assert drain(board, "check", ME) == [mine, theirs]
-    assert drain(board, "mentions", ME) == [mine]
-    assert drain(board, "mentions", PEER) == [theirs]
-    assert drain(board, "check", PEER) == [mine, theirs]
-    for mode, agent in [("check", ME), ("mentions", ME), ("mentions", PEER), ("check", PEER)]:
+    assert drain(board, "inbox", ME) == [mine]
+    assert drain(board, "inbox", PEER) == [theirs]
+    assert drain(board, BOARD, ME) == [theirs]
+    assert drain(board, BOARD, PEER) == [mine]
+    for mode, agent in [(BOARD, ME), ("inbox", ME), ("inbox", PEER), (BOARD, PEER)]:
         assert drain(board, mode, agent) == []
 
 
 @pytest.mark.parametrize("location", ["activity", "archived-thread", "scan-cap"])
 def test_poll_continuation_preserves_mentions(fake, client, config, location, monkeypatch):
     earlier, _ = board_for(client, config, minutes_ago=60)
-    assert drain(earlier, "mentions", ME) == []
+    assert drain(earlier, "inbox", ME) == []
 
     if location == "scan-cap":
         monkeypatch.setattr(db, "FETCH_LIMIT", 2)
@@ -623,8 +697,8 @@ def test_poll_continuation_preserves_mentions(fake, client, config, location, mo
         expected.append(fake.message(place, sf(30 - i, 2), f"@{ME} item {i}")["id"])
     board, _ = board_for(client, config)
 
-    assert drain(board, "mentions", ME, limit=2) == expected
-    assert drain(board, "mentions", ME, limit=2) == []
+    assert drain(board, "inbox", ME, limit=2) == expected
+    assert drain(board, "inbox", ME, limit=2) == []
 
 
 @pytest.mark.parametrize("failing", ["thread-messages", "active-discovery", "archived-discovery"])
@@ -638,28 +712,27 @@ def test_incomplete_poll_preserves_positions(fake, client, config, failing):
     fake.fail("GET", path, (403, {"message": "Missing Access"}))
     board, _ = board_for(client, config)
 
-    page = board.poll("mentions", agent=ME)
+    page = board.inbox(agent=ME)
     assert not page.coverage_complete and page.warnings
     board.commit(page)
     assert not list(config.state_dir.glob("*.json"))
-    assert drain(board, "mentions", ME) == tagged
+    assert drain(board, "inbox", ME) == tagged
 
 
-def test_first_use_reports_cutoff_and_history_is_read_only(fake, client, config):
+def test_first_use_reports_cutoff_and_older_history_pages_with_before(fake, client, config):
     old = [fake.message(BOARD, sf(60 * 24 * 5 + i), f"@{ME} old {i}")["id"] for i in (2, 1, 0)]
     new = fake.message(BOARD, sf(5), f"@{ME} new")["id"]
     board, _ = board_for(client, config)
 
-    page = board.poll("mentions", agent=ME)
+    page = board.inbox(agent=ME)
     assert [m["id"] for m in page.messages] == [new] and page.coverage_complete and page.notes
     board.commit(page)
 
-    history = board.poll("mentions", agent=ME, limit=2, before=new)
+    history = board.read(agent=ME, limit=2, before=new)
     assert [m["id"] for m in history.messages] == old[1:] and history.has_more
-    older = board.poll("mentions", agent=ME, limit=2, before=history.continuation[1])
+    older = board.read(agent=ME, limit=2, before=history.continuation[1])
     assert [m["id"] for m in older.messages] == old[:1] and not older.has_more
-    assert history.cursor is None and older.cursor is None
-    assert drain(board, "mentions", ME) == []
+    assert drain(board, "inbox", ME) == []
 
 
 def test_read_message_context_and_thread_history(fake, client, config):
@@ -669,12 +742,13 @@ def test_read_message_context_and_thread_history(fake, client, config):
     replies = [fake.message("5000", sf(20 - i), f"reply {i}")["id"] for i in range(5)]
     board, _ = board_for(client, config)
 
-    ctx = board.read(f"https://discord.com/channels/{GUILD}/{BOARD}/{chan[4]}", limit=5)
+    ctx = board.read(f"https://discord.com/channels/{GUILD}/{BOARD}/{chan[4]}", agent=ME, limit=5)
     assert [m["id"] for m in ctx.messages] == chan[2:7]
 
-    latest = board.read(f"https://discord.com/channels/{GUILD}/5000", limit=3)
+    latest = board.read(f"https://discord.com/channels/{GUILD}/5000", agent=ME, recent=True, limit=3)
     assert [m["id"] for m in latest.messages] == replies[2:] and latest.has_more
-    rest = board.read("5000", limit=3, before=latest.continuation[1])
+    assert latest.continuation[:2] == ["5000", "--before"]
+    rest = board.read("5000", agent=ME, limit=3, before=latest.continuation[2])
     assert [m["id"] for m in rest.messages] == [starter] + replies[:2]
     assert not rest.has_more and all(m["thread_name"] == "plan" for m in latest.messages)
 
@@ -690,7 +764,7 @@ def test_read_refuses_targets_outside_board(fake, client, config, target, error)
     reply = fake.message("5000", sf(5), "in a thread")["id"]
     board, _ = board_for(client, config)
     with pytest.raises(error):
-        board.read(reply if target == "thread-reply" else target)
+        board.read(reply if target == "thread-reply" else target, agent=ME)
 
 
 # --- CLI ------------------------------------------------------------------
@@ -715,7 +789,7 @@ def run(fake, tmp_path, monkeypatch):
 @pytest.mark.parametrize("as_json", [False, True])
 def test_cli_check_output(fake, run, capsys, as_json):
     msg = fake.message(BOARD, sf(5), f"Grüße @{ME} — ünïcode")
-    argv = ["mentions", "--agent", ME] + (["--json"] if as_json else [])
+    argv = ["inbox", "--agent", ME] + (["--json"] if as_json else [])
 
     assert run(*argv) == 0
     out = capsys.readouterr().out
@@ -741,10 +815,45 @@ def test_cli_post_reports_confirmed_link(fake, run, capsys, as_json):
     assert posted["author"]["username"] == ME and HOOK_TOKEN not in out
 
 
+@pytest.mark.parametrize("refused", [False, True])
+def test_cli_new_thread_opens_a_thread_on_the_post(fake, run, capsys, refused):
+    fake.threads_allowed = not refused
+    status = run("post", "--agent", ME, "--new-thread", "Index  rebuild", "--text", "starting")
+
+    captured = capsys.readouterr()
+    posted = fake.messages[BOARD][-1]
+    assert f"https://discord.com/channels/{GUILD}/{BOARD}/{posted['id']}" in captured.out
+    thread_call = fake.sent("POST")[-1]
+    assert thread_call["body"] == {"name": "Index rebuild"}
+    assert thread_call["headers"]["Authorization"] == f"Bot {BOT_TOKEN}"
+    if refused:
+        assert status == 1 and "Create Public Threads" in captured.err
+    else:
+        assert status == 0 and fake.channels[posted["id"]]["parent_id"] == BOARD
+        assert f"({posted['id']})" in captured.out
+
+
+def test_cli_read_shows_threads_and_marks_what_was_already_read(fake, run, capsys):
+    starter = fake.message(BOARD, sf(10), "topic")["id"]
+    fake.thread(starter, "Topic")
+    fake.message(starter, sf(9), "a reply in the thread")
+
+    assert run("read", "--agent", ME) == 0
+    first = capsys.readouterr().out
+    assert f'-> thread "Topic" ({starter}): 1 message' in first and "a reply" not in first
+    assert run("read", "--agent", ME) == 0
+    assert "No new messages. `read --recent`" in capsys.readouterr().out
+    assert run("read", "--agent", ME, "--recent") == 0
+    assert "(new)" not in capsys.readouterr().out
+    assert run("read", starter, "--agent", ME) == 0
+    thread = capsys.readouterr().out
+    assert thread.startswith(f'Thread "Topic" ({starter}), 1 message') and "a reply" in thread
+
+
 def test_cli_failures_exit_nonzero_without_state(fake, run, capsys, tmp_path, monkeypatch):
     fake.message(BOARD, sf(5), f"@{ME} hi")
     fake.fail("GET", f"/api/v10/guilds/{GUILD}/threads/active", (403, {"message": "Missing Access"}))
-    assert run("mentions", "--agent", ME) == 1
+    assert run("inbox", "--agent", ME) == 1
     assert "incomplete" in capsys.readouterr().err
 
     class Broken:
@@ -754,7 +863,7 @@ def test_cli_failures_exit_nonzero_without_state(fake, run, capsys, tmp_path, mo
         def flush(self):
             raise BrokenPipeError()
     monkeypatch.setattr(cli.sys, "stdout", Broken())
-    assert run("mentions", "--agent", ME) == 1
+    assert run("inbox", "--agent", ME) == 1
     monkeypatch.undo()
     assert not (tmp_path / "state").exists() or not list((tmp_path / "state").glob("*.json"))
     fake.fail("POST", f"/api/v10/webhooks/{HOOK_ID}/{HOOK_TOKEN}", socket.timeout("timed out"))
@@ -837,14 +946,14 @@ def setup_run_token(fake, tmp_path, monkeypatch):
 def test_cli_configures_itself_from_the_setup_token_on_first_use(fake, setup_run_token, capsys):
     fake.message(BOARD, sf(5), "@tyler/docs-site can you rerun the build?")
 
-    assert setup_run_token("mentions") == 0
+    assert setup_run_token("inbox") == 0
     first = capsys.readouterr()
     assert "rerun the build" in first.out and "configured the Discord board" in first.err
     assert "setup-token-xyz" not in first.out + first.err and BOT_TOKEN not in first.out + first.err
     setup = [r for r in fake.requests if r["path"] == "/setup"]
     assert [r["headers"]["Authorization"] for r in setup] == ["Bearer setup-token-xyz"]
 
-    assert setup_run_token("mentions") == 0
+    assert setup_run_token("inbox") == 0
     assert "configured the Discord board" not in capsys.readouterr().err
     assert len([r for r in fake.requests if r["path"] == "/setup"]) == 1
 
@@ -852,7 +961,7 @@ def test_cli_configures_itself_from_the_setup_token_on_first_use(fake, setup_run
 def test_cli_does_not_configure_from_a_refused_setup_token(fake, setup_run_token, capsys):
     fake.setup = 401
 
-    assert setup_run_token("mentions") == 1
+    assert setup_run_token("inbox") == 1
     err = capsys.readouterr().err
     assert "automatic setup" in err and "not set up on this machine" in err and "setup-token-xyz" not in err
     assert not setup_run_token.config_dir.exists()
@@ -889,7 +998,7 @@ def test_hand_written_files_need_no_server_id_and_the_server_is_saved(fake, tmp_
     folder = write_manual_config(home, channel_id=BOARD)
     fake.message(BOARD, sf(5), f"{ME} please look")
 
-    assert cli.main(["mentions", "--agent", ME], env={"HOME": str(home)}, opener=fake) == 0
+    assert cli.main(["inbox", "--agent", ME], env={"HOME": str(home)}, opener=fake) == 0
     assert "please look" in capsys.readouterr().out
     assert json.loads((folder / "config.json").read_text()) == {"channel_id": BOARD, "guild_id": GUILD}
 
@@ -897,14 +1006,14 @@ def test_hand_written_files_need_no_server_id_and_the_server_is_saved(fake, tmp_
 def test_a_server_learned_from_an_environment_channel_is_not_saved(fake, tmp_path):
     env = {"HOME": str(tmp_path / "home"), "DISCORD_BOARD_CHANNEL_ID": BOARD,
            "DISCORD_BOARD_BOT_TOKEN": BOT_TOKEN}
-    assert cli.main(["check", "--agent", ME], env=env, opener=fake) == 0
+    assert cli.main(["read", "--agent", ME], env=env, opener=fake) == 0
     assert not (tmp_path / "home" / ".config").exists()
 
 
 def test_a_board_channel_outside_any_server_is_an_error(fake, tmp_path, capsys):
     write_manual_config(tmp_path / "home", channel_id=BOARD)
     fake.channels[BOARD]["guild_id"] = None
-    assert cli.main(["check", "--agent", ME], env={"HOME": str(tmp_path / "home")}, opener=fake) == 1
+    assert cli.main(["read", "--agent", ME], env={"HOME": str(tmp_path / "home")}, opener=fake) == 1
     assert "not in a server" in capsys.readouterr().err
 
 
@@ -951,17 +1060,15 @@ def test_reading_positions_never_move_backwards_so_nothing_prints_twice(fake, cl
     for i, minutes in enumerate((50, 40, 30), start=1):
         say(f"t{i}", "5000", minutes, f"{ME} t{i}")
     board, _ = board_for(client, config)
-    board.commit(board.poll("check", agent=ME))
-
     printed = []
     for _ in range(10):
-        page = board.poll("mentions", agent=ME, limit=2)
+        page = board.inbox(agent=ME, limit=2)
         printed += [names[m["id"]] for m in page.messages]
         board.commit(page)
         if not page.has_more:
             break
 
-    assert sorted(printed) == ["b2", "b3", "b4", "t1", "t2", "t3"]
+    assert sorted(printed) == ["b1", "b2", "b3", "b4", "t1", "t2", "t3"]
 
 
 def test_credentials_travel_as_unredirected_headers(fake, config):
@@ -1087,7 +1194,7 @@ def test_rate_limits_are_retried_three_times_and_no_more(fake, client):
 
 def test_a_non_ascii_digit_is_a_usage_error(tmp_path):
     with pytest.raises(SystemExit) as err:
-        cli.main(["check", "--before", "\u00b2"], env={"HOME": str(tmp_path)})
+        cli.main(["read", "--before", "\u00b2"], env={"HOME": str(tmp_path)})
     assert err.value.code == 2
 
 
@@ -1095,7 +1202,7 @@ def test_read_refuses_before_on_a_single_message(fake, client, config):
     msg = fake.message(BOARD, sf(5), "hello")
     board, _ = board_for(client, config)
     with pytest.raises(db.BoardError, match="--before"):
-        board.read(f"https://discord.com/channels/{GUILD}/{BOARD}/{msg['id']}", before="5")
+        board.read(f"https://discord.com/channels/{GUILD}/{BOARD}/{msg['id']}", agent=ME, before="5")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
@@ -1112,15 +1219,9 @@ def test_setup_only_restricts_a_directory_it_created(fake, setup_run, tmp_path):
 
 
 def test_an_invalid_handle_is_refused_before_any_request(fake, setup_run_token, capsys):
-    assert setup_run_token("mentions", "--agent", "tyler/discord-x") == 1
+    assert setup_run_token("inbox", "--agent", "tyler/discord-x") == 1
     assert "does not allow" in capsys.readouterr().err
     assert fake.requests == []
-
-
-def test_explicit_ranges_never_commit_a_position(fake, client, config):
-    fake.message(BOARD, sf(60), f"{ME} old")
-    board, _ = board_for(client, config)
-    assert board.poll("mentions", agent=ME, after=sf(90)).cursor is None
 
 
 def test_a_webhook_from_another_server_is_refused(fake, client):
@@ -1140,7 +1241,7 @@ def test_system_messages_never_show_up(fake, client, config):
     system = fake.message(BOARD, sf(5), f"{ME} joined the server")
     system["type"] = 7
     board, _ = board_for(client, config)
-    assert board.poll("mentions", agent=ME).messages == [] and board.poll("check", agent=ME).messages == []
+    assert board.inbox(agent=ME).messages == [] and board.read(agent=ME).messages == []
 
 
 def test_threads_archived_across_several_pages_are_all_discovered(fake, client, config, monkeypatch):
@@ -1149,7 +1250,7 @@ def test_threads_archived_across_several_pages_are_all_discovered(fake, client, 
         fake.thread(str(6000 + i), f"old-{i}", archived_ago=minutes)
     hit = fake.message("6004", sf(55), f"{ME} from the oldest archived thread")["id"]
     board, _ = board_for(client, config)
-    assert [m["id"] for m in board.poll("mentions", agent=ME).messages] == [hit]
+    assert [m["id"] for m in board.inbox(agent=ME).messages] == [hit]
 
 
 # --- runtime --------------------------------------------------------------
@@ -1166,5 +1267,5 @@ def test_cli_runs_stdlib_only_from_anywhere(tmp_path):
         done = subprocess.run([sys.executable, "-S", *argv], cwd=tmp_path, env=env,
                               capture_output=True, text=True, timeout=30)
         assert done.returncode == 0, done.stderr
-    assert "check" in done.stdout and "post" in done.stdout
+    assert "inbox" in done.stdout and "post" in done.stdout
     assert not (tmp_path / "state").exists() and not (tmp_path / "home").exists()
