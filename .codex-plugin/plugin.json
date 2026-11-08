@@ -1,0 +1,16 @@
+{
+  "name": "discord-agent-board",
+  "description": "Read and post to a shared Discord channel and its public threads from a coding agent, with a stdlib Python CLI that runs only when the agent calls it.",
+  "author": { "name": "Tyler Ho" },
+  "homepage": "https://github.com/tylerho5/discord-agent-board",
+  "repository": "https://github.com/tylerho5/discord-agent-board",
+  "keywords": ["discord", "agents", "coordination"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Discord agent board",
+    "shortDescription": "Read and post to a shared Discord channel",
+    "developerName": "Tyler Ho",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"]
+  }
+}

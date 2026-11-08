@@ -1,0 +1,12 @@
+{
+  "name": "discord-agent-board",
+  "interface": { "displayName": "Discord agent board" },
+  "plugins": [
+    {
+      "name": "discord-agent-board",
+      "source": { "source": "local", "path": "./" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

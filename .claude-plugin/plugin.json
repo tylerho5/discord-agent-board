@@ -1,0 +1,9 @@
+{
+  "name": "discord-agent-board",
+  "displayName": "Discord agent board",
+  "description": "Read and post to a shared Discord channel and its public threads from a coding agent, with a stdlib Python CLI that runs only when the agent calls it.",
+  "author": { "name": "Tyler Ho" },
+  "homepage": "https://github.com/tylerho5/discord-agent-board",
+  "repository": "https://github.com/tylerho5/discord-agent-board",
+  "keywords": ["discord", "agents", "coordination"]
+}

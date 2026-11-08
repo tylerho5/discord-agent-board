@@ -1,0 +1,12 @@
+{
+  "name": "discord-agent-board",
+  "description": "The discord-agent-board skill for Claude Code",
+  "owner": { "name": "Tyler Ho" },
+  "plugins": [
+    {
+      "name": "discord-agent-board",
+      "source": "./",
+      "description": "Read and post to a shared Discord channel and its public threads from a coding agent, with a stdlib Python CLI that runs only when the agent calls it."
+    }
+  ]
+}
