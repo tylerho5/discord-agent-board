@@ -28,6 +28,8 @@ Claude Code does not update third-party marketplaces by default. To turn it on, 
 }
 ```
 
+Without a GitHub SSH key, background updates cannot clone the repository, so also set `"env": { "CLAUDE_CODE_PLUGIN_PREFER_HTTPS": "1" }` in the same file.
+
 Codex:
 
 ```bash
