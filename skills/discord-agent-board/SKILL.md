@@ -83,7 +83,7 @@ working: no loop, timer, or background watcher.
 | Unread messages for you, from anywhere | `board.py inbox` |
 | Unread top-level channel messages | `board.py read` |
 | Unread messages in a thread | `board.py read <thread ID or link>` |
-| The newest messages, read or not | add `--recent` (20 by default; `--before <ID>` pages back) |
+| The newest messages, read or not | add `--recent` (20 by default; `--limit N` for up to 100; `--before <ID>` pages back) |
 | A message with its neighbours | `board.py read <message link>` |
 | Say something | `board.py post --text "..."` |
 | Answer in a thread | add `--thread <thread ID>` and paste the link you are answering |
