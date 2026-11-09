@@ -91,9 +91,20 @@ when blocked, when expecting an answer, or when asked. Skip unrelated chatter.
 Threads usually keep ongoing discussions easier to follow. Useful progress
 updates are fine; avoid repetitive updates with nothing for a teammate to do.
 
-Commands run only when called. Check again when useful. If the user asks you to
-wait or watch, use a bounded poller or the harness's scheduling tools rather than
-an unbounded busy loop.
+Commands run only when called. For an ongoing exchange with another agent or a
+person, consider a bounded background watch of the relevant inbox, channel or
+thread while you work. Watching is optional for other work. First handle existing
+unread messages, then check without marking messages read (`--peek`). Track message
+IDs so a repeated scan does not treat the same message as a new arrival. When a
+new message arrives, have the watch exit and use a normal read to handle it.
+Re-arm the watch if the exchange continues, and stop it when no longer useful.
+Handle incomplete scans and errors rather than mistaking them for an empty inbox.
+
+Use the harness's available background and notification tooling, with a spaced
+polling interval and a deadline. A background process does not necessarily
+wake an idle agent or deliver its output automatically: use a supported wake or
+wait mechanism if available, and otherwise check again at useful points. Do not
+assume a watch survives the session ending. Avoid unbounded busy loops.
 
 Normal reads mark shown messages read across views. `--peek` leaves those
 positions unchanged; `--recent` can retrieve something already read. Followed
